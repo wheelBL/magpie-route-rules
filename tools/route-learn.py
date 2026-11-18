@@ -415,9 +415,66 @@ def main():
     ap.add_argument("--pause-max", type=int, default=DEFAULT_PAUSE_MAX, help="backoff cap (ms)")
     ap.add_argument("--classify", metavar="TEXT", help="classify one error text with the AI and print the verdict")
     ap.add_argument("--bootstrap", action="store_true", help="fresh machine: seed rules from /v1/models + register the learning task")
+    ap.add_argument("--learned", action="store_true", help="print what has been learned (images / actions / counters), change nothing")
     args = ap.parse_args()
 
     key = gateway_key()
+
+    if args.status:
+        try:
+            plugins = load_json(args.plugins)
+            entry = find_entry(plugins)
+            options = (entry or {}).get("options") or {}
+            learned = options.get("learned") or {}
+            images = learned.get("images") or {}
+            actions = learned.get("actions") or []
+            state = load_json(args.state) if os.path.exists(args.state) else {}
+            fails = state.get("fails") or {}
+            success = state.get("success") or {}
+        except Exception as err:
+            print("读取失败：%s" % err)
+            return 1
+        now = int(time.time() * 1000)
+        print("== 图片能力标记（learned.images，TTL %dh）==" % (args.ttl // 3600000))
+        if not images:
+            print("  （无——尚无带图失败样本；所有候选按未知能力对待，允许试探）")
+        for model, entry0 in images.items():
+            state0 = entry0.get("state")
+            left_min = max(0, round(((entry0.get("at") or 0) + args.ttl - now) / 60000))
+            age_min = round((now - (entry0.get("at") or 0)) / 60000)
+            if state0 == "bad":
+                print("  %s: 不可用（%d 分钟前失败，%d 分钟后过期恢复试探）→ 带图请求跳过" % (model, age_min, left_min))
+            elif state0 == "good":
+                print("  %s: 可用（正学习确认）" % model)
+            else:
+                print("  %s: %s" % (model, state0))
+        print("== 失败处理动作（learned.actions，执行中）==")
+        live = [a for a in actions if (now - (a.get("at") or 0)) < (a.get("ttlMs") or 0)]
+        expired = len(actions) - len(live)
+        if not actions:
+            print("  （无——尚无失败签名；常见失败由规则分类，未知签名由 AI 分类）")
+        for a in actions:
+            left = max(0, round(((a.get("at") or 0) + (a.get("ttlMs") or 0) - now) / 60000))
+            state1 = "生效中" if a in live else "已过期"
+            extra = " cap=%s" % a["cap"] if "cap" in a else ""
+            reason = " | %s" % a["reason"] if a.get("reason") else ""
+            print("  %s: %s%s [%s，剩 %d 分钟，by=%s]%s" % (a.get("model"), a.get("kind"), extra, state1, left, a.get("by"), reason))
+        if expired:
+            print("  （另有 %d 条已过期动作，会随下次写入清理）" % expired)
+        print("== 连败计数（指数退避用）==")
+        print("  " + (json.dumps(fails, ensure_ascii=False) if fails else "（无）"))
+        print("== 观察到的健康模型（最近成功 top%d）==" % SUCCESS_KEEP)
+        for m, v in sorted(success.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:8]:
+            print("  %s: 成功 %s 次，最近 %s" % (m, v.get("count"), time.strftime("%m-%d %H:%M", time.localtime((v.get("lastAt") or 0) / 1000))))
+        if not success:
+            print("  （无）")
+        print("== 当前生效的规则（中间件正在执行的）==")
+        for r in options.get("rules") or []:
+            cand = [r.get("target")] + list(r.get("fallbacks") or [])
+            print("  %s → %s（fallbacks: %s）" % (r.get("type"), r.get("target"), ", ".join(r.get("fallbacks") or [])))
+        print("== 读取位置 ==")
+        print("  usage.jsonl offset=%s" % state.get("offset"))
+        return 0
 
     if args.bootstrap:
         try:
