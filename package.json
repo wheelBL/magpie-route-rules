@@ -1,6 +1,6 @@
 {
   "name": "magpie-route-rules",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "Request-aware routing rules with self-learning (image capability + failure actions via AI/rule classification) as a magpie gateway middleware",
   "type": "module",
   "files": [

@@ -478,6 +478,94 @@ def backoff_ms(fails_count, pause_base, pause_max):
     return min(int(pause_base) * (2 ** max(0, int(fails_count))), int(pause_max))
 
 
+REFLECT_PROMPT = (
+    "你是 LLM 网关路由学习系统的反思审查员。以下是学习器的当前状态摘要、"
+    "规则反思器已发现的洞察、以及最近的请求记录。请做一次深度反思：\n"
+    "1) 验证已有洞察是否成立，指出其中可能误判的\n"
+    "2) 发现规则反思器没覆盖到的问题（如趋势恶化、能力退化、配置矛盾）\n"
+    "3) 给出 1-3 条具体可执行的改进建议\n"
+    "用中文简洁分点；只依据给出的数据，不要编造。\n\n"
+)
+
+
+def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_text, candidates):
+    record = (
+        "【性能画像】\n" + json.dumps(perf, ensure_ascii=False) +
+        "\n【图片能力标记】\n" + json.dumps(images, ensure_ascii=False) +
+        "\n【失败动作】\n" + json.dumps(actions, ensure_ascii=False) +
+        "\n【规则反思器的洞察】\n" + json.dumps([i.get("text") for i in insights], ensure_ascii=False) +
+        "\n【最近请求记录（新→旧）】\n" + recent_rows_text
+    )
+    messages = [{"role": "user", "content": REFLECT_PROMPT + record}]
+    return ai_chat(messages, args, candidates, max_tokens=800)
+
+
+def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, image_ttl_ms):
+    """周期性自省：审视学到的状态，发现过时、矛盾、覆盖缺口。
+    返回 insights 列表 [{level: warn|info|suggest, text}]。"""
+    insights = []
+    # 1. 图片候选全灭检测：所有候选都被拉黑（fresh bad）→ 带图请求将必败
+    image_targets = []
+    for rule in rules or []:
+        if rule.get("type") != "images":
+            continue
+        cands = [rule.get("target")] + list(rule.get("fallbacks") or [])
+        for m in cands:
+            if m and m not in image_targets:
+                image_targets.append(m)
+    if image_targets:
+        fresh_bad = [m for m in image_targets
+                     if isinstance(images.get(m), dict) and images[m].get("state") == "bad"
+                     and (now_ms - (images[m].get("at") or 0)) < image_ttl_ms]
+        if len(fresh_bad) == len(image_targets):
+            insights.append({"level": "warn",
+                             "text": "图片候选全部不可用（%s）——带图请求将失败；检查网关或增补候选"
+                                     % ", ".join(fresh_bad)})
+    # 2. 连败 ≥2 的模型：熔断在自动处理，但持续连败值得人工关注
+    for m, p in perf.items():
+        cf = int(p.get("consecFails") or 0)
+        if cf >= 2:
+            insights.append({"level": "warn",
+                             "text": "%s 连败 %d 次（吞吐率 %s tok/s）——若非流量特性变化，建议人工检查该模型"
+                                     % (m, cf, p.get("ewmaTps"))})
+    # 3. 从未被试探的候选：能力未知（可能是从未有过带图/该类流量的模型）
+    unsampled = [m for m, p in perf.items() if int(p.get("samples") or 0) == 0]
+    if unsampled:
+        insights.append({"level": "info",
+                         "text": "候选 %s 尚无采样数据——能力未知，建议用小请求主动试探一次" % ", ".join(unsampled)})
+    # 4. clampOutput 长期未验证：模型上限可能已变化（半开试探依据）
+    for a in actions:
+        if a.get("kind") == "clampOutput":
+            age_min = round((now_ms - (a.get("at") or 0)) / 60000)
+            if age_min > 7 * 24 * 60:
+                insights.append({"level": "info",
+                                 "text": "%s 的 clampOutput cap=%s 已 %d 天未验证——模型上限可能已变化"
+                                         % (a.get("model"), a.get("cap"), age_min // 1440)})
+    # 5. images 拉黑即将到期：提示恢复试探即将开始
+    for m, entry0 in images.items():
+        if entry0.get("state") == "bad":
+            left_min = round(((entry0.get("at") or 0) + image_ttl_ms - now_ms) / 60000)
+            if 0 < left_min <= 30:
+                insights.append({"level": "info",
+                                 "text": "%s 的图片拉黑还剩 %d 分钟到期——到期后将恢复带图试探" % (m, left_min)})
+                break
+    # 6. 评分排名与候选顺序的差距（自适应因防抖未换头的状态可见化）
+    for rule in rules or []:
+        if rule.get("type") != "images":
+            continue
+        cands = [rule.get("target")] + list(rule.get("fallbacks") or [])
+        scored = [(m, perf_score(perf.get(m))) for m in cands if m]
+        sampled = [x for x in scored if x[1] is not None]
+        if len(sampled) < 2:
+            continue
+        sampled.sort(key=lambda t: -t[1])
+        if sampled[0][0] != cands[0]:
+            insights.append({"level": "info",
+                             "text": "按当前评分 %s 应排首位（现任 %s 差距不足防抖阈值，暂不换头）"
+                                     % (sampled[0][0], cands[0])})
+    return insights
+
+
 def bootstrap(entry, args, key):
     """Self-discovery on a fresh machine: seed image-routing rules from the
     gateway's own model list, ordered by models that recently served 200;
@@ -582,6 +670,7 @@ def main():
     ap.add_argument("--explain-rows", type=int, default=20, help="rows of recent usage fed to the AI narrative")
     ap.add_argument("--bootstrap", action="store_true", help="fresh machine: seed rules from /v1/models + register the learning task")
     ap.add_argument("--learned", action="store_true", help="print what has been learned (images / actions / counters), change nothing")
+    ap.add_argument("--reflect", action="store_true", help="scan + rule insights + AI deep reflection (verifies learned state, finds problems)")
     args = ap.parse_args()
 
     key = gateway_key()
@@ -666,6 +755,17 @@ def main():
             print("  （另有 %d 条已过期动作，会随下次写入清理）" % expired)
         print("== 连败计数（指数退避用）==")
         print("  " + (json.dumps(fails, ensure_ascii=False) if fails else "（无）"))
+        print("== 反思洞察（周期自省产出）==")
+        insights_state = state.get("insights") or []
+        if not insights_state:
+            print("  （无——当前状态健康，无待关注事项）")
+        for ins in insights_state:
+            print("  [%s] %s" % (ins.get("level"), ins.get("text")))
+        last_reflect = state.get("lastReflect") or {}
+        if last_reflect.get("at"):
+            print("  上次 AI 深度反思: %s（%s）" % (
+                time.strftime("%m-%d %H:%M", time.localtime((last_reflect.get("at") or 0) / 1000)),
+                str(last_reflect.get("model") or "")))
         print("== 性能画像与评分（体验自适应依据）==")
         perf_rows = []
         for m, p in perf.items():
@@ -980,6 +1080,26 @@ def main():
             continue
         if isinstance(cur, dict) and cur.get("state") == "bad" and (now_ms - (cur.get("at") or 0)) >= args.ttl:
             del images[key]
+
+    # ── 周期反思：审视学到的状态，发现过时/矛盾/覆盖缺口 ──
+    insights = reflect_on_state(options.get("rules") or [], images, actions, perf, fails,
+                                state.get("ignore_sigs") or {}, now_ms, args.ttl)
+    state["insights"] = insights[:10]
+
+    # ── AI 深度反思（--reflect）：验证规则洞察 + 发现未覆盖的问题 ──
+    if args.reflect and not args.no_ai:
+        available = fetch_available_models(key)
+        candidates = ai_candidates(args, success, available, perf)
+        recent_rows_text = "\n".join(lines[-max(1, args.explain_rows):])
+        print("== AI 深度反思 ==")
+        narrative, used, err = ai_deep_reflect(args, perf, success, images, actions,
+                                               insights, recent_rows_text, candidates)
+        if narrative is None:
+            print("（AI 深度反思不可用：%s）" % err)
+        else:
+            print("（反思模型：%s）" % used)
+            print(narrative)
+            state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:2000]}
 
     state["success"] = success
     state["fails"] = fails
