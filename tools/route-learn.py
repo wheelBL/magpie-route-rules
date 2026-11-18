@@ -242,6 +242,148 @@ def ai_candidates(args, success, available, perf=None):
     return candidates
 
 
+def ai_chat(messages, args, candidates, max_tokens=800):
+    """Generic gateway chat call, tried across candidates in order.
+    Returns (content, used_model, error)."""
+    key = gateway_key()
+    if not key:
+        return None, None, "no gateway key"
+    if not candidates:
+        return None, None, "no candidates"
+    last_err = "no candidates"
+    for model in candidates[:3]:
+        payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": False}
+        if model.startswith("cannbot/"):
+            payload["reasoning_effort"] = "minimal"
+        req = urllib.request.Request(GATEWAY, data=json.dumps(payload).encode(), headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key,
+            "User-Agent": USER_AGENT,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            if not content.strip():
+                last_err = "%s: 空回复" % model
+                continue
+            return content.strip(), model, None
+        except Exception as err:
+            last_err = "%s: %s" % (model, err)
+            continue
+    return None, None, last_err
+
+
+def build_explain_digest(args, perf, now_ms):
+    """Read current learning state + recent usage rows; return (digest_text, rows_text)."""
+    state = load_json(args.state) if os.path.exists(args.state) else {"perf": {}, "diag": {}, "success": {}, "fails": {}}
+    perf_map = state.get("perf") or {}
+    fails = state.get("fails") or {}
+    diag = state.get("diag") or {}
+    try:
+        plugins = load_json(args.plugins)
+        entry = find_entry(plugins)
+        options = (entry or {}).get("options") or {}
+    except Exception:
+        options = {}
+    learned = options.get("learned") or {}
+    images = learned.get("images") or {}
+    actions = learned.get("actions") or []
+
+    out_lines = []
+    out_lines.append("【当前生效规则】")
+    for r in options.get("rules") or []:
+        out_lines.append("  %s → %s（fallbacks: %s）" % (r.get("type"), r.get("target"), ", ".join(r.get("fallbacks") or [])))
+    out_lines.append("【图片能力标记】")
+    if images:
+        for model, entry0 in images.items():
+            state0 = entry0.get("state")
+            age_min = round((now_ms - (entry0.get("at") or 0)) / 60000)
+            tag = "不可用（带图请求会跳过）" if state0 == "bad" else ("可用" if state0 == "good" else state0)
+            out_lines.append("  %s: %s（%d 分钟前标记）" % (model, tag, age_min))
+    else:
+        out_lines.append("  （无标记）")
+    out_lines.append("【失败处理动作（执行中）】")
+    if actions:
+        for a in actions:
+            left = max(0, round(((a.get("at") or 0) + (a.get("ttlMs") or 0) - now_ms) / 60000))
+            out_lines.append("  %s: %s（剩 %d 分钟，by=%s%s）" % (a.get("model"), a.get("kind"), left, a.get("by"), (", cap=%s" % a["cap"]) if "cap" in a else ""))
+    else:
+        out_lines.append("  （无）")
+    out_lines.append("【性能画像（吞吐率 tokens/s，EWMA）】")
+    for m, p in sorted(perf_map.items(), key=lambda kv: -(kv[1].get("samples") or 0))[:10]:
+        out_lines.append("  %s: %.1f tok/s（采样 %d，连败 %d）" % (m, p.get("ewmaTps") or 0, p.get("samples") or 0, p.get("consecFails") or 0))
+    out_lines.append("【连败计数】 " + (json.dumps(fails, ensure_ascii=False) if fails else "（无）"))
+    digest_text = "\n".join(out_lines)
+
+    # recent usage rows (tail)
+    rows_text = "（无法读取 usage 日志）"
+    try:
+        if os.path.exists(args.usage) and os.path.getsize(args.usage) > 0:
+            with open(args.usage, "rb") as fh:
+                fh.seek(max(0, os.path.getsize(args.usage) - 512 * 1024))
+                text = fh.read().decode("utf-8", "replace")
+            complete = text.split("\n")
+            complete = complete[:-1] if text.endswith("\n") else complete
+            picked = []
+            for line in reversed(complete):
+                if len(picked) >= args.explain_rows:
+                    break
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                picked.append(json.dumps({
+                    "time": row.get("t"), "agent": row.get("agent"), "req": row.get("req"),
+                    "model": row.get("model"), "served": row.get("served"), "status": row.get("status"),
+                    "ms": row.get("ms"), "ttft_ms": row.get("ttft_ms"), "out": row.get("out"),
+                }, ensure_ascii=False))
+            rows_text = "\n".join(picked) if picked else "（无记录）"
+    except Exception as err:
+        rows_text = "（读取失败：%s）" % err
+    return digest_text, rows_text
+
+
+def explain_mode(args, key):
+    now_ms = int(time.time() * 1000)
+    args.explain_rows = getattr(args, "explain_rows", 20) or 20
+    try:
+        state = load_json(args.state) if os.path.exists(args.state) else {"perf": {}, "diag": {}, "success": {}, "fails": {}}
+    except Exception:
+        state = {"perf": {}, "diag": {}, "success": {}, "fails": {}}
+    perf = state.get("perf") or {}
+    digest_text, rows_text = build_explain_digest(args, perf, now_ms)
+    print(digest_text)
+    print("== 最近请求记录（新→旧，最多 %d 条）==" % args.explain_rows)
+    print(rows_text)
+    if args.no_ai:
+        return 0
+    available = fetch_available_models(key)
+    success = {}
+    try:
+        state = load_json(args.state)
+        success = state.get("success") or {}
+    except Exception:
+        pass
+    candidates = ai_candidates(args, success, available, perf)
+    messages = [{"role": "user", "content":
+        "你是 LLM 网关路由的学习分析师。以下是路由学习器的当前状态和最近的请求记录。\n"
+        "请用中文分点输出：\n"
+        "1) 最近路由行为的主要模式\n"
+        "2) 值得注意的异常或风险\n"
+        "3) 学习系统已经做了哪些调整\n"
+        "简洁；只依据给出的数据，不要编造数据里没有的信息。\n\n"
+        "【当前状态】\n" + digest_text + "\n\n【最近请求记录（新→旧）】\n" + rows_text}]
+    print("== AI 解读（分类模型自动选择）==")
+    content, used, err = ai_chat(messages, args, candidates, max_tokens=800)
+    if content is None:
+        print("（AI 解读不可用：%s）" % err)
+        return 0
+    print("（分类模型：%s）" % used)
+    print(content)
+    return 0
+
+
 def ai_classify(row, model_key, args, candidates):
     """Try the candidates in order; return (verdict, used_model, error)."""
     key = gateway_key()
@@ -436,6 +578,8 @@ def main():
     ap.add_argument("--pause-base", type=int, default=DEFAULT_PAUSE_BASE, help="first-failure pause duration (ms)")
     ap.add_argument("--pause-max", type=int, default=DEFAULT_PAUSE_MAX, help="backoff cap (ms)")
     ap.add_argument("--classify", metavar="TEXT", help="classify one error text with the AI and print the verdict")
+    ap.add_argument("--explain", action="store_true", help="print learning digest + AI narrative of recent routing behavior")
+    ap.add_argument("--explain-rows", type=int, default=20, help="rows of recent usage fed to the AI narrative")
     ap.add_argument("--bootstrap", action="store_true", help="fresh machine: seed rules from /v1/models + register the learning task")
     ap.add_argument("--learned", action="store_true", help="print what has been learned (images / actions / counters), change nothing")
     args = ap.parse_args()
@@ -532,6 +676,9 @@ def main():
         print("== 读取位置 ==")
         print("  usage.jsonl offset=%s" % state.get("offset"))
         return 0
+
+    if args.explain:
+        return explain_mode(args, key)
 
     if args.bootstrap:
         try:
