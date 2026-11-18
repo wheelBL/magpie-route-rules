@@ -194,9 +194,18 @@ def fetch_available_models(key):
         return None
 
 
-def ai_candidates(args, success, available):
+def perf_score(pstats):
+    """体验综合分：稳定性（连败惩罚）× 速度（吞吐率 EWMA）。样本不足返回 None。"""
+    if not pstats or (pstats.get("samples") or 0) < 2:
+        return None
+    cf = pstats.get("consecFails") or 0
+    tps = pstats.get("ewmaTps") or 0
+    return round(tps / (1 + cf), 1)
+
+
+def ai_candidates(args, success, available, perf=None):
     """Ordered classification-model candidates: explicit override first, then
-    recently-successful models (most recent first), then anything listed."""
+    体验分排序（稳定且快者优先），再按最近成功，最后任意可用。"""
     candidates = []
 
     def push(model):
@@ -214,7 +223,19 @@ def ai_candidates(args, success, available):
             push(args.ai_model)
         elif args.ai_model in recent:
             push(args.ai_model)
+    # 体验分排序（≥2 采样才有分数），未采样保持原顺序
+    scored = []
+    unscored = []
     for m in recent:
+        s = perf_score(perf.get(m)) if perf else None
+        if s is None:
+            unscored.append(m)
+        else:
+            scored.append((m, s))
+    scored.sort(key=lambda t: -t[1])
+    for m, _ in scored:
+        push(m)
+    for m in unscored:
         push(m)
     for m in available or []:
         push(m)
@@ -533,7 +554,7 @@ def main():
     keywords = [k.strip().lower() for k in str(args.keywords).split(",") if k.strip()]
     clamp_skip = {p.strip() for p in str(args.clamp_skip_providers).split(",") if p.strip()}
 
-    state = {"usage": args.usage, "offset": 0, "success": {}, "fails": {}, "diag": {}}
+    state = {"usage": args.usage, "offset": 0, "success": {}, "fails": {}, "diag": {}, "perf": {}}
     try:
         raw = load_json(args.state)
         if isinstance(raw, dict) and raw.get("usage") == args.usage:
@@ -542,12 +563,15 @@ def main():
                 state["success"] = raw["success"]
             if isinstance(raw.get("fails"), dict):
                 state["fails"] = raw["fails"]
+            if isinstance(raw.get("perf"), dict):
+                state["perf"] = raw["perf"]
             if isinstance(raw.get("diag"), dict):
                 state["diag"] = raw["diag"]
     except Exception:
         pass
     success = state["success"]
     fails = state["fails"]
+    perf = state["perf"]
 
     def save_state_diag(reason):
         state["diag"] = {"reason": reason, "at": int(time.time() * 1000)}
@@ -600,7 +624,15 @@ def main():
     learned = options.get("learned") if isinstance(options.get("learned"), dict) else {}
     images = dict(learned.get("images") if isinstance(learned.get("images"), dict) else {})
     actions = list(learned.get("actions") if isinstance(learned.get("actions"), list) else [])
+    # ignore-kind records are dedup bookkeeping, not enforcement: keep them in
+    # the learner's own state, out of the middleware-visible options.
+    ignore_sigs = dict(state.get("ignore_sigs") or {})
+    for a in actions:
+        if isinstance(a, dict) and a.get("kind") == "ignore" and a.get("signature"):
+            ignore_sigs.setdefault(a["signature"], {"model": a.get("model"), "at": a.get("at") or int(time.time() * 1000)})
+    actions = [a for a in actions if isinstance(a, dict) and a.get("kind") != "ignore"]
     known_sigs = {a.get("signature") for a in actions if isinstance(a, dict)}
+    known_sigs.update(ignore_sigs.keys())
     ai_used = 0
     ai_errors = []
     updates = {}
@@ -635,6 +667,26 @@ def main():
             scan_diag["noModel"] += 1
             continue
         model_key = "%s/%s" % (provider, model) if provider else model
+
+        # 每个完成请求都进性能画像：吞吐率/首字节 EWMA + 连败计数（稳定性）。
+        # 200 归零连败（自恢复），>=400 累加。
+        pstats = perf.setdefault(model_key, {"samples": 0, "consecFails": 0, "ewmaTps": None, "ewmaTtfbMs": None, "lastAt": 0})
+        pstats["lastAt"] = now_ms
+        pstats["samples"] = int(pstats.get("samples") or 0) + 1
+        if status == 200:
+            pstats["consecFails"] = 0
+            out_n = row.get("out")
+            ms_n = row.get("ms")
+            ttft = row.get("ttft_ms")
+            if isinstance(out_n, (int, float)) and out_n > 0 and isinstance(ms_n, (int, float)) and ms_n > 0:
+                tps = out_n / ms_n * 1000
+                prev = pstats.get("ewmaTps")
+                pstats["ewmaTps"] = round(tps, 1) if prev is None else round(prev * 0.7 + tps * 0.3, 1)
+            if isinstance(ttft, (int, float)) and ttft > 0:
+                prev = pstats.get("ewmaTtfbMs")
+                pstats["ewmaTtfbMs"] = round(ttft) if prev is None else round(prev * 0.7 + ttft * 0.3)
+        elif isinstance(status, int) and status >= 400:
+            pstats["consecFails"] = int(pstats.get("consecFails") or 0) + 1
 
         # A 200 from real traffic is the strongest recovery signal: clear any
         # fresh pause right away and reset the backoff counter (minimal
@@ -678,7 +730,7 @@ def main():
                     continue  # seen this novelty before; its action is still fresh
                 if verdict is None and not args.no_ai and ai_used < args.ai_cap:
                     available = fetch_available_models(key)
-                    candidates = ai_candidates(args, success, available)
+                    candidates = ai_candidates(args, success, available, perf)
                     if candidates:
                         verdict, used, why = ai_classify(row, model_key, args, candidates)
                         ai_used += 1
@@ -763,8 +815,44 @@ def main():
 
     state["success"] = success
     state["fails"] = fails
+    perf_bounded = dict(sorted(perf.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:30])
+    state["perf"] = perf_bounded
     state["diag"] = dict(scan_diag)
     state["diag"]["lastRunAt"] = now_ms
+
+    # ── 体验自适应：按实测评分重排 images 规则的候选顺序（迟滞防抖）──
+    # 稳定（无连败）且吞吐率高者优先；现任与挑战者差距 <15% 不换（防抖）。
+    options_dirty = False
+    for rule in options.get("rules") or []:
+        if rule.get("type") != "images":
+            continue
+        cands = [rule.get("target")] + list(rule.get("fallbacks") or [])
+        cands = [m for m in cands if m]
+        scored = []
+        for i, m in enumerate(cands):
+            pstats = perf.get(m)
+            s = perf_score(pstats) if pstats and (pstats.get("samples") or 0) >= 2 else None
+            scored.append((m, s))
+        known_scored = [x for x in scored if x[1] is not None]
+        if not known_scored or len(cands) < 2:
+            continue
+        known_scored.sort(key=lambda t: -t[1])
+        best_m, best_s = known_scored[0]
+        cur_m = cands[0]
+        cur_s = next((s for m, s in known_scored if m == cur_m), None)
+        if best_m == cur_m:
+            continue
+        if cur_s is not None and best_s < cur_s * 1.15:
+            continue  # 挑战者优势不足 15%，不换（防抖）
+        new_order = [best_m] + [m for m in cands if m != best_m]
+        rule["target"] = best_m
+        rule["fallbacks"] = new_order[1:]
+        log("images 规则自适应调整：%s → %s（评分 %.1f，现任 %.1f）" % (cur_m, best_m, best_s, cur_s or 0), args.quiet)
+        options_dirty = True
+    if options_dirty:
+        backup(args.plugins)
+        entry["options"] = options
+        atomic_write_json(args.plugins, plugins)
     new_offset_state = dict(state)
     new_offset_state["offset"] = new_offset
     if args.dry_run:
