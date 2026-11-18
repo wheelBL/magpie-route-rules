@@ -451,6 +451,26 @@ def main():
             print("  流量来源(agent): " + ", ".join("%s×%d" % (k, v) for k, v in top))
         if diag.get("reason"):
             print("  上次提前退出原因: %s" % diag["reason"])
+        # 计划任务自诊断（Windows）
+        try:
+            q = subprocess.run(["schtasks", "/query", "/tn", "Magpie route learn", "/v", "/fo", "LIST"],
+                               capture_output=True, timeout=20)
+            out = q.stdout.decode("gbk", "replace") if isinstance(q.stdout, bytes) else str(q.stdout)
+            fields = {}
+            for line in out.splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    fields[k.strip()] = v.strip()
+            status = fields.get("状态") or fields.get("Status")
+            lastrun = fields.get("上次运行时间") or fields.get("Last Run Time")
+            lastres = fields.get("上次结果") or fields.get("Last Result")
+            torun = fields.get("要运行的任务") or fields.get("Task To Run")
+            print("== 计划任务「Magpie route learn」==")
+            print("  状态: %s | 上次运行: %s | 上次结果: %s" % (status or "未知", lastrun or "从未", lastres))
+            if torun:
+                print("  命令: %s" % torun)
+        except Exception as err:
+            print("== 计划任务查询失败（%s）==" % err)
         print("== 图片能力标记（learned.images，TTL %dh）==" % (args.ttl // 3600000))
         if not images:
             print("  （无——尚无带图失败样本；所有候选按未知能力对待，允许试探）")
