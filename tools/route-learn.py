@@ -420,7 +420,7 @@ def main():
 
     key = gateway_key()
 
-    if args.status:
+    if args.learned:
         try:
             plugins = load_json(args.plugins)
             entry = find_entry(plugins)
@@ -431,10 +431,26 @@ def main():
             state = load_json(args.state) if os.path.exists(args.state) else {}
             fails = state.get("fails") or {}
             success = state.get("success") or {}
+            diag = state.get("diag") or {}
         except Exception as err:
             print("读取失败：%s" % err)
             return 1
         now = int(time.time() * 1000)
+        usage_exists = os.path.exists(args.usage)
+        usage_size = os.path.getsize(args.usage) if usage_exists else 0
+        print("== 运行诊断 ==")
+        print("  usage 文件: %s（%s，%d 字节）" % (args.usage, "存在" if usage_exists else "不存在", usage_size))
+        print("  读取位置 offset: %s" % state.get("offset"))
+        last_at = diag.get("lastRunAt") or 0
+        print("  上次扫描: %s | 扫描 %s 行 | 成功200: %s | 学到失败动作: %s | 自身流量跳过: %s" % (
+            time.strftime("%m-%d %H:%M", time.localtime(last_at / 1000)) if last_at else "从未运行",
+            diag.get("scanned"), diag.get("success200"), diag.get("learnedFailures"), diag.get("ownSkipped")))
+        agents = diag.get("agents") or {}
+        if agents:
+            top = sorted(agents.items(), key=lambda kv: -kv[1])[:5]
+            print("  流量来源(agent): " + ", ".join("%s×%d" % (k, v) for k, v in top))
+        if diag.get("reason"):
+            print("  上次提前退出原因: %s" % diag["reason"])
         print("== 图片能力标记（learned.images，TTL %dh）==" % (args.ttl // 3600000))
         if not images:
             print("  （无——尚无带图失败样本；所有候选按未知能力对待，允许试探）")
@@ -470,7 +486,6 @@ def main():
             print("  （无）")
         print("== 当前生效的规则（中间件正在执行的）==")
         for r in options.get("rules") or []:
-            cand = [r.get("target")] + list(r.get("fallbacks") or [])
             print("  %s → %s（fallbacks: %s）" % (r.get("type"), r.get("target"), ", ".join(r.get("fallbacks") or [])))
         print("== 读取位置 ==")
         print("  usage.jsonl offset=%s" % state.get("offset"))
@@ -509,7 +524,7 @@ def main():
     options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
     targets = rule_targets(options)
 
-    state = {"usage": args.usage, "offset": 0, "success": {}, "fails": {}}
+    state = {"usage": args.usage, "offset": 0, "success": {}, "fails": {}, "diag": {}}
     try:
         raw = load_json(args.state)
         if isinstance(raw, dict) and raw.get("usage") == args.usage:
@@ -518,15 +533,23 @@ def main():
                 state["success"] = raw["success"]
             if isinstance(raw.get("fails"), dict):
                 state["fails"] = raw["fails"]
+            if isinstance(raw.get("diag"), dict):
+                state["diag"] = raw["diag"]
     except Exception:
         pass
     success = state["success"]
     fails = state["fails"]
 
+    def save_state():
+        state["diag"]["lastRunAt"] = int(time.time() * 1000)
+        atomic_write_json(args.state, state)
+
     now_ms = int(time.time() * 1000)
     if not os.path.exists(args.usage):
-        log("usage 文件不存在：%s" % args.usage, args.quiet)
-        atomic_write_json(args.state, state)
+        reason = "usage 文件不存在：%s（检查 magpie 配置目录是否在 ~/.config/magpie）" % args.usage
+        log(reason, args.quiet)
+        state["diag"] = {"reason": reason, "at": now_ms}
+        save_state()
         return 0
     size = os.path.getsize(args.usage)
     offset = state["offset"] if size >= state["offset"] else 0
@@ -536,12 +559,14 @@ def main():
     new_offset = offset + len(chunk)
     text = chunk.decode("utf-8", "replace")
     if "\n" not in text:
-        atomic_write_json(args.state, state)
+        state["diag"] = {"reason": "无完整新行（offset=%d, size=%d）" % (offset, size), "at": now_ms}
+        save_state()
         log("无完整新行（offset=%d）" % offset, args.quiet)
         return 0
     lines = text.split("\n")
     tail = lines.pop()
     new_offset = offset + len(chunk) - len(tail.encode("utf-8"))
+    scan_diag = {"scanned": 0, "success200": 0, "learnedFailures": 0, "ownSkipped": 0, "noModel": 0, "parseSkipped": 0, "agents": {}}
 
     learned = options.get("learned") if isinstance(options.get("learned"), dict) else {}
     images = dict(learned.get("images") if isinstance(learned.get("images"), dict) else {})
@@ -563,9 +588,14 @@ def main():
         try:
             row = json.loads(line)
         except Exception:
+            scan_diag["parseSkipped"] += 1
             continue
+        scan_diag["scanned"] += 1
         agent = str(row.get("agent") or "")
+        if agent:
+            scan_diag["agents"][agent] = scan_diag["agents"].get(agent, 0) + 1
         if USER_AGENT.split("/")[0] in agent or agent == "Python-urllib":
+            scan_diag["ownSkipped"] += 1
             continue  # never learn from our own traffic
         status = row.get("status")
         if isinstance(status, str) and status.isdigit():
@@ -573,6 +603,7 @@ def main():
         provider = str(row.get("provider") or "")
         model = row.get("model")
         if not model:
+            scan_diag["noModel"] += 1
             continue
         model_key = "%s/%s" % (provider, model) if provider else model
 
@@ -580,6 +611,7 @@ def main():
         # fresh pause right away and reset the backoff counter (minimal
         # impact — a recovered model serves again the moment it can).
         if status == 200:
+            scan_diag["success200"] += 1
             if fails.get(model_key):
                 fails[model_key] = 0
             paused = find_action(model_key, "pause")
@@ -675,6 +707,7 @@ def main():
                 known_sigs.add(sig)
             updates[model_key] = {"kind": "clampOutput", "cap": cap}
         else:
+            scan_diag["learnedFailures"] += 1
             action = {"model": model_key, "kind": "ignore", "ttlMs": int(verdict.get("ttlMs") or IGNORE_TTL_MS),
                       "at": now_ms, "by": by, "signature": sig}
             if verdict.get("reason"):
@@ -697,6 +730,8 @@ def main():
 
     state["success"] = success
     state["fails"] = fails
+    state["diag"] = dict(scan_diag)
+    state["diag"]["lastRunAt"] = now_ms
     new_offset_state = dict(state)
     new_offset_state["offset"] = new_offset
     if args.dry_run:
