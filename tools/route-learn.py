@@ -512,18 +512,6 @@ def main():
     keywords = [k.strip().lower() for k in str(args.keywords).split(",") if k.strip()]
     clamp_skip = {p.strip() for p in str(args.clamp_skip_providers).split(",") if p.strip()}
 
-    try:
-        plugins = load_json(args.plugins)
-    except Exception as err:
-        log("读取 plugins.json 失败：%s" % err, args.quiet)
-        return 1
-    entry = find_entry(plugins)
-    if entry is None:
-        log("plugins.json 中没有 route-rules 插件条目，跳过", args.quiet)
-        return 1
-    options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
-    targets = rule_targets(options)
-
     state = {"usage": args.usage, "offset": 0, "success": {}, "fails": {}, "diag": {}}
     try:
         raw = load_json(args.state)
@@ -539,6 +527,26 @@ def main():
         pass
     success = state["success"]
     fails = state["fails"]
+
+    def save_state_diag(reason):
+        state["diag"] = {"reason": reason, "at": int(time.time() * 1000)}
+        atomic_write_json(args.state, state)
+
+    try:
+        plugins = load_json(args.plugins)
+    except Exception as err:
+        reason = "读取 plugins.json 失败：%s" % err
+        save_state_diag(reason)
+        log(reason, args.quiet)
+        return 1
+    entry = find_entry(plugins)
+    if entry is None:
+        reason = "plugins.json 中没有 route-rules 插件条目（插件未安装或 spec 变化）"
+        save_state_diag(reason)
+        log(reason, args.quiet)
+        return 1
+    options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+    targets = rule_targets(options)
 
     def save_state():
         state["diag"]["lastRunAt"] = int(time.time() * 1000)
