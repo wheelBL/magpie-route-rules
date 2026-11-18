@@ -1,16 +1,32 @@
 {
   "name": "magpie-route-rules",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Request-aware routing rules with self-learning (image capability + failure actions via AI/rule classification) as a magpie gateway middleware",
   "type": "module",
-  "files": ["route-rules.middleware.js", "README.md"],
-  "keywords": ["magpie", "magpie-middleware", "routing", "model-routing", "llm-gateway"],
+  "files": [
+    "route-rules.middleware.js",
+    "README.md"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-middleware",
+    "routing",
+    "model-routing",
+    "llm-gateway"
+  ],
   "license": "MIT",
   "magpie": {
     "middleware": "./route-rules.middleware.js",
     "options": {
       "rules": [
-        { "type": "images", "target": "<视觉模型，如 provider/vision-model>", "fallbacks": ["<第二候选>", "<第三候选>"] }
+        {
+          "type": "images",
+          "target": "<视觉模型，如 provider/vision-model>",
+          "fallbacks": [
+            "<第二候选>",
+            "<第三候选>"
+          ]
+        }
       ],
       "clamp": true
     }
