@@ -73,6 +73,7 @@ GATEWAY_MODELS = "http://127.0.0.1:3425/v1/models"
 DSH_ENV = os.path.join(os.path.expanduser("~"), ".dsh", ".env")
 DEFAULT_PAUSE_BASE = 2 * 60 * 1000
 DEFAULT_PAUSE_MAX = 60 * 60 * 1000
+PAUSE_TTL_MS = 10 * 60 * 1000
 IGNORE_TTL_MS = 30 * 24 * 3600 * 1000
 CLAMP_TTL_MS = 24 * 3600 * 1000
 SUCCESS_KEEP = 20
@@ -258,7 +259,7 @@ def ai_classify(row, model_key, args, candidates):
             continue
         ttl = verdict.get("ttlMs")
         if not (isinstance(ttl, (int, float)) and 60000 <= ttl <= 86400000):
-            ttl = PAUSE_TTL_MS_PLACEHOLDER or 600000
+            ttl = PAUSE_TTL_MS  # 10min default when the AI omits an out-of-range TTL
         out = {"kind": verdict["kind"], "ttlMs": int(ttl), "reason": str(verdict.get("reason") or "")[:120]}
         if verdict["kind"] == "clampOutput":
             cap = verdict.get("cap")
@@ -651,97 +652,101 @@ def main():
             success[model_key]["lastAt"] = now_ms
             continue
 
-        image_failed = row_matches(row, statuses, keywords)
-        if not image_failed and status is not None and status != 499 and not str(row.get("err") or ""):
-            continue  # no error text and not an image failure: nothing to learn
-
         # Clamp and pause failures bypass the signature dedup: a repeated
         # clamp names a new ceiling (update in place), a repeated pause is
         # exactly the escalation signal the backoff needs. Other kinds dedup
         # by signature so the AI classifier is consulted once per novelty.
-        clamp_err = re.search(r"expected a value\s*<=\s*(\d+)", str(row.get("err") or "").lower())
-        sig = signature(model_key, row)
+        # Everything below is wrapped: one bad row logs and skips, it must
+        # never kill the whole scan (a crash here froze offset forever).
+        try:
+            clamp_err = re.search(r"expected a value\s*<=\s*(\d+)", str(row.get("err") or "").lower())
+            sig = signature(model_key, row)
+            image_failed = row_matches(row, statuses, keywords)
 
-        verdict = None
-        by = None
-        if image_failed:
-            if targets and model_key not in targets and model not in targets:
-                continue
-            images[model_key] = {"state": "bad", "at": now_ms}
-            updates[model_key] = {"kind": "skipImages"}
-            by = "rule"
-        else:
-            verdict = rule_classify(row, clamp_skip)
-            known = sig in known_sigs
-            if verdict is None and known:
-                continue  # seen this novelty before; its action is still fresh
-            if verdict is None and not args.no_ai and ai_used < args.ai_cap:
-                available = fetch_available_models(key)
-                candidates = ai_candidates(args, success, available)
-                if candidates:
-                    verdict, used, why = ai_classify(row, model_key, args, candidates)
-                    ai_used += 1
-                    if verdict is None:
-                        ai_errors.append(why)
-                        log("AI 分类失败（%s）：%s" % (model_key, why), args.quiet)
-                    else:
-                        log("AI 分类（%s 用 %s）：%s" % (model_key, used, json.dumps(verdict, ensure_ascii=False)), args.quiet)
-            if verdict is None:
-                verdict = {"kind": "pause", "ttlMs": 0} if (
-                    isinstance(status, int) and status >= 500) else {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
-                by = "default"
-            else:
+            verdict = None
+            by = None
+            if image_failed:
+                if targets and model_key not in targets and model not in targets:
+                    continue
+                images[model_key] = {"state": "bad", "at": now_ms}
+                updates[model_key] = {"kind": "skipImages"}
                 by = "rule"
-        if verdict is None:
-            continue
-        if by is None:
-            by = "ai"
+            else:
+                verdict = rule_classify(row, clamp_skip)
+                known = sig in known_sigs
+                if verdict is None and known:
+                    continue  # seen this novelty before; its action is still fresh
+                if verdict is None and not args.no_ai and ai_used < args.ai_cap:
+                    available = fetch_available_models(key)
+                    candidates = ai_candidates(args, success, available)
+                    if candidates:
+                        verdict, used, why = ai_classify(row, model_key, args, candidates)
+                        ai_used += 1
+                        if verdict is None:
+                            ai_errors.append(why)
+                            log("AI 分类失败（%s）：%s" % (model_key, why), args.quiet)
+                        else:
+                            log("AI 分类（%s 用 %s）：%s" % (model_key, used, json.dumps(verdict, ensure_ascii=False)), args.quiet)
+                if verdict is None:
+                    verdict = {"kind": "pause", "ttlMs": 0} if (
+                        isinstance(status, int) and status >= 500) else {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
+                    by = "default"
+                else:
+                    by = "rule"
+            if verdict is None:
+                continue
+            if by is None:
+                by = "ai"
 
-        kind = verdict["kind"]
-        if kind == "pause":
-            # exponential backoff: 2min, 4min, 8min … capped; the counter
-            # resets the moment a 200 proves recovery.
-            duration = backoff_ms(fails.get(model_key, 0), args.pause_base, args.pause_max)
-            fails[model_key] = int(fails.get(model_key, 0)) + 1
-            existing = find_action(model_key, "pause")
-            if existing is not None:
-                existing["at"] = now_ms
-                existing["ttlMs"] = duration
-                existing["by"] = by
+            kind = verdict["kind"]
+            if kind == "pause":
+                # exponential backoff: 2min, 4min, 8min … capped; the counter
+                # resets the moment a 200 proves recovery.
+                duration = backoff_ms(fails.get(model_key, 0), args.pause_base, args.pause_max)
+                fails[model_key] = int(fails.get(model_key, 0)) + 1
+                existing = find_action(model_key, "pause")
+                if existing is not None:
+                    existing["at"] = now_ms
+                    existing["ttlMs"] = duration
+                    existing["by"] = by
+                else:
+                    action = {"model": model_key, "kind": "pause", "ttlMs": duration,
+                              "at": now_ms, "by": by, "signature": sig}
+                    if verdict.get("reason"):
+                        action["reason"] = str(verdict["reason"])[:120]
+                    actions.append(action)
+                    known_sigs.add(sig)
+                updates[model_key] = {"kind": "pause", "ttlMs": duration}
+            elif kind == "clampOutput":
+                cap = int(verdict.get("cap") or 0)
+                existing = find_action(model_key, "clampOutput")
+                if existing is not None:
+                    # the newest error's ceiling wins; refresh so it stays fresh
+                    existing["cap"] = cap
+                    existing["at"] = now_ms
+                    existing["ttlMs"] = max(int(verdict.get("ttlMs") or CLAMP_TTL_MS), existing.get("ttlMs") or 0)
+                    existing["by"] = by
+                else:
+                    action = {"model": model_key, "kind": "clampOutput", "cap": cap,
+                              "ttlMs": int(verdict.get("ttlMs") or CLAMP_TTL_MS),
+                              "at": now_ms, "by": by, "signature": sig}
+                    if verdict.get("reason"):
+                        action["reason"] = str(verdict["reason"])[:120]
+                    actions.append(action)
+                    known_sigs.add(sig)
+                updates[model_key] = {"kind": "clampOutput", "cap": cap}
             else:
-                action = {"model": model_key, "kind": "pause", "ttlMs": duration,
+                scan_diag["learnedFailures"] += 1
+                action = {"model": model_key, "kind": "ignore", "ttlMs": int(verdict.get("ttlMs") or IGNORE_TTL_MS),
                           "at": now_ms, "by": by, "signature": sig}
                 if verdict.get("reason"):
                     action["reason"] = str(verdict["reason"])[:120]
                 actions.append(action)
                 known_sigs.add(sig)
-            updates[model_key] = {"kind": "pause", "ttlMs": duration}
-        elif kind == "clampOutput":
-            cap = int(verdict.get("cap") or 0)
-            existing = find_action(model_key, "clampOutput")
-            if existing is not None:
-                # the newest error's ceiling wins; refresh so it stays fresh
-                existing["cap"] = cap
-                existing["at"] = now_ms
-                existing["ttlMs"] = max(int(verdict.get("ttlMs") or CLAMP_TTL_MS), existing.get("ttlMs") or 0)
-                existing["by"] = by
-            else:
-                action = {"model": model_key, "kind": "clampOutput", "cap": cap,
-                          "ttlMs": int(verdict.get("ttlMs") or CLAMP_TTL_MS),
-                          "at": now_ms, "by": by, "signature": sig}
-                if verdict.get("reason"):
-                    action["reason"] = str(verdict["reason"])[:120]
-                actions.append(action)
-                known_sigs.add(sig)
-            updates[model_key] = {"kind": "clampOutput", "cap": cap}
-        else:
-            scan_diag["learnedFailures"] += 1
-            action = {"model": model_key, "kind": "ignore", "ttlMs": int(verdict.get("ttlMs") or IGNORE_TTL_MS),
-                      "at": now_ms, "by": by, "signature": sig}
-            if verdict.get("reason"):
-                action["reason"] = str(verdict["reason"])[:120]
-            actions.append(action)
-            known_sigs.add(sig)
+        except Exception as err:
+            scan_diag["rowErrors"] = scan_diag.get("rowErrors", 0) + 1
+            log("行学习失败（%s）：%s" % (model_key, err), args.quiet)
+            continue
 
     # keep the success map bounded: most recent first
     success = dict(sorted(success.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:SUCCESS_KEEP])
