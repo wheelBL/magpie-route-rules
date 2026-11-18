@@ -597,6 +597,7 @@ def main():
             state = load_json(args.state) if os.path.exists(args.state) else {}
             fails = state.get("fails") or {}
             success = state.get("success") or {}
+            perf = state.get("perf") or {}
             diag = state.get("diag") or {}
         except Exception as err:
             print("读取失败：%s" % err)
@@ -665,6 +666,26 @@ def main():
             print("  （另有 %d 条已过期动作，会随下次写入清理）" % expired)
         print("== 连败计数（指数退避用）==")
         print("  " + (json.dumps(fails, ensure_ascii=False) if fails else "（无）"))
+        print("== 性能画像与评分（体验自适应依据）==")
+        perf_rows = []
+        for m, p in perf.items():
+            samples = int(p.get("samples") or 0)
+            s = perf_score(p) if samples >= 2 else None
+            img = images.get(m) or {}
+            img_bad = isinstance(img, dict) and img.get("state") == "bad"
+            perf_rows.append((m, p, s, img_bad))
+        if not perf_rows:
+            print("  （无采样——伴生扫描尚未积累）")
+        else:
+            # 评分降序（None 末尾），与中间件的自适应优先级一致
+            perf_rows.sort(key=lambda t: (-(t[2] if t[2] is not None else -1)))
+            for m, p, s, img_bad in perf_rows:
+                tps = "%.1f" % p["ewmaTps"] if p.get("ewmaTps") is not None else "-"
+                ttfb = "%.0fms" % p["ewmaTtfbMs"] if p.get("ewmaTtfbMs") is not None else "-"
+                score = "%.1f" % s if s is not None else "采样不足"
+                extra = " | 图片暂不可用" if img_bad else ""
+                print("  %s: 评分 %s | %.1f tok/s | 首字节 %s | 连败 %d | 采样 %d%s" % (
+                    m, score, p.get("ewmaTps") or 0, ttfb, p.get("consecFails") or 0, p.get("samples") or 0, extra))
         print("== 观察到的健康模型（最近成功 top%d）==" % SUCCESS_KEEP)
         for m, v in sorted(success.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:8]:
             print("  %s: 成功 %s 次，最近 %s" % (m, v.get("count"), time.strftime("%m-%d %H:%M", time.localtime((v.get("lastAt") or 0) / 1000))))
