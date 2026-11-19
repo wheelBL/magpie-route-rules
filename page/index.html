@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>路由规则学习全景</title>
+<script src="_magpie/bridge.js"></script>
+<script src="app.js" defer></script>
+<style>
+  body { font-size: 13px; padding: 12px; max-width: 960px }
+  h2 { font-size: 15px; margin: 18px 0 6px }
+  table { width: 100%; border-collapse: collapse; margin: 4px 0 10px }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid color-mix(in srgb, var(--magpie-fg, #888) 22%, transparent) }
+  th { opacity: .65; font-weight: 600 }
+  .num { text-align: right; font-variant-numeric: tabular-nums }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; margin-right: 8px; font-size: 12px }
+  .warn { background: color-mix(in srgb, #d97706 18%, transparent) }
+  .info { background: color-mix(in srgb, #2563eb 15%, transparent) }
+  .suggest { background: color-mix(in srgb, #7c3aed 15%, transparent) }
+  .good { color: #16a34a } .bad { color: #dc2626 }
+  .muted { opacity: .6 }
+  .meta { opacity: .6; font-size: 12px }
+  pre { white-space: pre-wrap; margin: 6px 0; font-size: 12px }
+  p { margin: 4px 0 }
+</style>
+</head>
+<body>
+<p class="meta" id="meta">加载中…</p>
+
+<h2>模型优先级（体验评分，评分降序 = 路由优先顺序）</h2>
+<table>
+  <thead><tr><th>模型</th><th class="num">评分</th><th class="num">tok/s</th><th class="num">首字节</th><th class="num">采样</th><th class="num">连败</th></tr></thead>
+  <tbody id="perf"></tbody>
+</table>
+
+<h2>反思洞察</h2>
+<div id="insights"></div>
+
+<h2>图片能力标记</h2>
+<div id="images"></div>
+
+<h2>失败处理动作（执行中）</h2>
+<div id="actions"></div>
+
+<h2>AI 深度反思</h2>
+<div id="reflect"></div>
+</body>
+</html>
