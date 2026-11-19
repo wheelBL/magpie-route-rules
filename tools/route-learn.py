@@ -159,6 +159,12 @@ def rule_classify(row, clamp_skip_providers):
     # 499: the client canceled — normal, nothing to handle.
     if status == 499:
         return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
+    # 413: payload too large — deterministic content failure. The same body
+    # always fails; pausing would wrongly block small requests too, and
+    # clamping output is irrelevant. The error propagates so the caller can
+    # shrink the input (routing can't fix a shared gateway size limit).
+    if status == 413 or "payload too large" in err or "request entity too large" in err or "request too large" in err:
+        return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
     # Output budget over the model's real ceiling: the provider plugin for
     # clamp-skip-providers (e.g. cannbot) already clamps and switches along
     # its chain — clamping here would defeat that switch.
