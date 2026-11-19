@@ -580,7 +580,9 @@ def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_
 def compute_impact(usage_path, now_ms, window_days=7):
     """从 usage 历史量化插件效果（7 天滚动窗口）：
     - saves: model≠served 且 200 = 透明切换挽救的请求（预算切换/流重试/链重试）
-    - availability: 实际成功率；availabilityNoPlugin: 估计无插件成功率（把挽救算作会失败）
+    - availability: 实际成功率；switchGuaranteed: 依赖透明切换的请求数
+      （预算/流/链切换保障了完整交付——其中预算切换防的是截断/空回复这类
+      质量失败而非 HTTP 失败，不做不可辩护的"无插件可用度"反事实推断）
     - medianTtftS/medianDurationS: 200 请求的首字节/总耗时中位数（秒）。"""
     import datetime
     window_ms = window_days * 24 * 3600 * 1000
@@ -660,7 +662,7 @@ def compute_impact(usage_path, now_ms, window_days=7):
         "saves": saves,
         "savesDetail": dict(sorted(switch_pairs.items(), key=lambda kv: -kv[1])[:5]),
         "availability": round(100.0 * ok / total, 1),
-        "availabilityNoPlugin": round(100.0 * max(0, ok - saves) / total, 1),
+        "switchGuaranteedPct": round(100.0 * saves / total, 1),
         "medianTtftS": med(ttfts),
         "medianDurationS": med(durations),
     }
@@ -1482,8 +1484,8 @@ def main():
         if impact:
             state["impact"] = impact
             state["lastImpactScan"] = now_ms
-            log("效果量化已更新：7d %d 请求 / 挽救 %d / 可用度 %.1f%%（估计无插件 %.1f%%）"
-                % (impact["requests"], impact["saves"], impact["availability"], impact["availabilityNoPlugin"]), args.quiet)
+            log("效果量化已更新：7d %d 请求 / 切换保障 %d 次（%.1f%%）/ 可用度 %.1f%%"
+                % (impact["requests"], impact["saves"], impact["switchGuaranteedPct"], impact["availability"]), args.quiet)
 
     learned_view = build_learned_view(perf, images, actions, insights, state.get("lastReflect"), now_ms)
     learned_view = with_impact(learned_view, state)

@@ -29,9 +29,9 @@ function render(o) {
     document.getElementById('impactSub').textContent = im.windowDays + ' 天滚动 · 排除伴生流量'
     const cards = [
       { cls: 'good', label: '可用度', value: im.availability != null ? im.availability : '—', unit: '%',
-        delta: im.availabilityNoPlugin != null ? ['无插件估计', im.availabilityNoPlugin + '%', Math.max(0, im.availability - im.availabilityNoPlugin)] : null },
-      { cls: 'warn', label: '自动挽救', value: im.saves != null ? im.saves : '—', unit: ' 次',
-        delta: ['透明切换后成功', null, null] },
+        delta: ['7 天 HTTP 成功率', null, null] },
+      { cls: 'warn', label: '切换保障', value: im.saves != null ? im.saves : '—', unit: ' 次',
+        delta: ['占请求 ' + (im.switchGuaranteedPct != null ? im.switchGuaranteedPct + '%' : '—') + ' · 预算/流透明切换保障完整交付', null, null] },
       { cls: '', label: '请求总数', value: im.requests != null ? im.requests : '—', unit: ' (' + im.windowDays + 'd)',
         delta: ['失败 ' + Math.max(0, Math.round((im.requests || 0) * (1 - (im.availability || 100) / 100))) + ' 次', null, null] },
       { cls: '', label: '首字节中位', value: im.medianTtftS != null ? im.medianTtftS : '—', unit: 's',
