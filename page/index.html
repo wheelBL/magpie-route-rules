@@ -57,8 +57,9 @@
   }
   .model .rank { font-size: 15px; font-weight: 700; color: var(--faint); text-align: center }
   .model.first .rank { color: var(--accent) }
-  .model .name { font-weight: 600; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-  .model .name .deg { color: var(--warn); font-size: 10.5px; margin-left: 6px }
+  .model .name { display: flex; flex-direction: column; min-width: 0; gap: 1px }
+  .model .name .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 12.5px }
+  .model .name .deg { color: var(--warn); font-size: 10.5px }
   .model .bar { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--fg) 8%, transparent); overflow: hidden }
   .model .bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--ok))) }
   .model .stat { text-align: right; font-variant-numeric: tabular-nums }

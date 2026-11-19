@@ -74,12 +74,12 @@ function render(o) {
   rows.forEach((e, i) => {
     const m = el('div', 'model' + (i === 0 ? ' first' : ''))
     m.appendChild(el('div', 'rank', String(i + 1)))
-    const nm = el('div', 'name', e.model)
+    const nameBox = el('div', 'name')
+    nameBox.appendChild(el('span', 'nm', e.model))
     if (e.degraded) {
-      const dg = el('span', 'deg', '⚠ ' + e.degraded + ' 降级')
-      nm.appendChild(dg)
+      nameBox.appendChild(el('span', 'deg', '⚠ ' + e.degraded + ' 降级'))
     }
-    m.appendChild(nm)
+    m.appendChild(nameBox)
     const bar = el('div', 'bar')
     const fill = el('i')
     fill.style.width = Math.round(100 * (e.score || 0) / maxScore) + '%'
