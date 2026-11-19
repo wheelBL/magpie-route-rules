@@ -602,7 +602,7 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
     }
     if last_reflect:
         view["lastReflect"] = {"at": last_reflect.get("at"), "model": last_reflect.get("model"),
-                               "text": str(last_reflect.get("text") or "")[:800]}
+                               "text": str(last_reflect.get("text") or "")[:4000]}
     return view
 
 
@@ -1286,7 +1286,7 @@ def main():
         else:
             print("（反思模型：%s）" % used)
             print(narrative)
-            state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:2000]}
+            state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:4000]}
         state["lastAiReflectAt"] = now_ms
 
     # ── AI 深度反思自动触发：距上次 ≥24h 且本轮有新内容 ──
@@ -1302,7 +1302,7 @@ def main():
                 narrative, used, err = ai_deep_reflect(args, perf, success, images, actions,
                                                        insights, recent_rows_text, candidates)
                 if narrative:
-                    state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:2000]}
+                    state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:4000]}
                     log("AI 深度反思自动完成（%s）——洞察 %d 条" % (used, len(insights)), args.quiet)
                 state["lastAiReflectAt"] = now_ms
             except Exception as err:
