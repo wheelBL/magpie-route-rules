@@ -577,6 +577,95 @@ def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_
     return ai_chat(messages, args, candidates, max_tokens=800)
 
 
+def compute_impact(usage_path, now_ms, window_days=7):
+    """从 usage 历史量化插件效果（7 天滚动窗口）：
+    - saves: model≠served 且 200 = 透明切换挽救的请求（预算切换/流重试/链重试）
+    - availability: 实际成功率；availabilityNoPlugin: 估计无插件成功率（把挽救算作会失败）
+    - medianTtftS/medianDurationS: 200 请求的首字节/总耗时中位数（秒）。"""
+    import datetime
+    window_ms = window_days * 24 * 3600 * 1000
+
+    def norm_model(s):
+        return str(s).lower().replace(".", "-").replace("_", "-")
+
+    def same_model(a, b):
+        na, nb = norm_model(a), norm_model(b)
+        return na == nb or na.startswith(nb) or nb.startswith(na)
+
+    saves = 0
+    ok = 0
+    fail = 0
+    ttfts = []
+    durations = []
+    switch_pairs = {}
+    try:
+        size = os.path.getsize(usage_path) if os.path.exists(usage_path) else 0
+        if size <= 0:
+            return None
+        with open(usage_path, "rb") as fh:
+            fh.seek(max(0, size - 30 * 1024 * 1024))
+            text = fh.read().decode("utf-8", "replace")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            ts = row.get("t")
+            try:
+                epoch_ms = int(datetime.datetime.fromisoformat(str(ts)).timestamp() * 1000)
+            except Exception:
+                continue
+            if now_ms - epoch_ms > window_ms:
+                continue
+            agent = str(row.get("agent") or "")
+            if "route-learn" in agent or agent == "Python-urllib":
+                continue
+            status = row.get("status")
+            if isinstance(status, str) and status.isdigit():
+                status = int(status)
+            model = str(row.get("model") or "")
+            served = str(row.get("served") or "")
+            if status == 200:
+                ok += 1
+                if model and served and not same_model(model, served):
+                    saves += 1
+                    key = "%s→%s" % (model.split("/")[-1], served.split("/")[-1])
+                    switch_pairs[key] = switch_pairs.get(key, 0) + 1
+                ms = row.get("ms")
+                if isinstance(ms, (int, float)) and ms > 0:
+                    durations.append(ms)
+                ttft = row.get("ttft_ms")
+                if isinstance(ttft, (int, float)) and ttft > 0:
+                    ttfts.append(ttft)
+            elif isinstance(status, int) and status >= 400:
+                fail += 1
+    except Exception:
+        return None
+
+    def med(arr):
+        if not arr:
+            return None
+        arr = sorted(arr)
+        return round(arr[len(arr) // 2] / 1000, 1)
+
+    total = ok + fail
+    if not total:
+        return None
+    return {
+        "windowDays": window_days,
+        "requests": total,
+        "saves": saves,
+        "savesDetail": dict(sorted(switch_pairs.items(), key=lambda kv: -kv[1])[:5]),
+        "availability": round(100.0 * ok / total, 1),
+        "availabilityNoPlugin": round(100.0 * max(0, ok - saves) / total, 1),
+        "medianTtftS": med(ttfts),
+        "medianDurationS": med(durations),
+    }
+
+
 def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
     """人读视图：伴生写进 options.learnedView，magpie 插件页渲染。"""
     perf_summary = []
@@ -603,6 +692,14 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
     if last_reflect:
         view["lastReflect"] = {"at": last_reflect.get("at"), "model": last_reflect.get("model"),
                                "text": str(last_reflect.get("text") or "")[:4000]}
+    return view
+
+
+def with_impact(view, state):
+    """把效果量化（state.impact，每小时由主循环重算）挂进视图。"""
+    impact = state.get("impact")
+    if impact:
+        view["impact"] = impact
     return view
 
 
@@ -985,6 +1082,7 @@ def main():
             insights0 = reflect_on_state(options.get("rules") or [], images0, actions0, perf0,
                                          state.get("fails") or {}, state.get("ignore_sigs") or {}, now0, args.ttl)
             view0 = build_learned_view(perf0, images0, actions0, insights0, state.get("lastReflect"), now0)
+            view0 = with_impact(view0, state)
             if view0 != options.get("learnedView"):
                 backup(args.plugins)
                 options["learned"] = {"images": images0, "actions": actions0}
@@ -1377,7 +1475,18 @@ def main():
 
     # ── GUI 可见性：人读视图写进 options.learnedView（magpie 插件页直接可看）──
     # learnedView 是功能性 learned 的兄弟键：中间件只读 learned.*，不受影响。
+    # ── 效果量化（每小时重算 7 天窗口，避免每 5 分钟扫全量日志）──
+    last_impact_at = state.get("lastImpactScan") or 0
+    if now_ms - last_impact_at >= 3600 * 1000:
+        impact = compute_impact(args.usage, now_ms)
+        if impact:
+            state["impact"] = impact
+            state["lastImpactScan"] = now_ms
+            log("效果量化已更新：7d %d 请求 / 挽救 %d / 可用度 %.1f%%（估计无插件 %.1f%%）"
+                % (impact["requests"], impact["saves"], impact["availability"], impact["availabilityNoPlugin"]), args.quiet)
+
     learned_view = build_learned_view(perf, images, actions, insights, state.get("lastReflect"), now_ms)
+    learned_view = with_impact(learned_view, state)
     view_changed = learned_view != options.get("learnedView")
     changed = actions != (learned.get("actions") if isinstance(learned.get("actions"), list) else []) \
         or images != (learned.get("images") if isinstance(learned.get("images"), dict) else {}) \
