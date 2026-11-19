@@ -209,6 +209,57 @@ def perf_score(pstats):
     return round(tps / (1 + cf), 1)
 
 
+def time_bucket(now=None):
+    """(周末?, 时段桶0-3)：上游负载有时段规律（晚高峰/工作时段），
+    分桶统计让评分贴合'现在这个时间'的真实表现而非全天混合均值。"""
+    t = time.localtime(time.time() if now is None else now)
+    return (1 if t.tm_wday >= 5 else 0), t.tm_hour // 6
+
+
+def bucket_key(now_ms=None):
+    wk, hb = time_bucket(None if now_ms is None else now_ms / 1000)
+    return "%d_%d" % (wk, hb)
+
+
+def perf_score_bucket(pstats, bkey):
+    """时段桶内评分：样本 ≥3 且有吞吐率数据时优先于全局分（更贴近当下）。"""
+    b = (pstats.get("buckets") or {}).get(bkey)
+    if b and (b.get("samples") or 0) >= 3 and b.get("ewmaTps"):
+        return round(b["ewmaTps"] / (1 + (b.get("consecFails") or 0)), 1)
+    return None
+
+
+def perf_score_now(pstats, now_ms=None):
+    """时段感知评分：桶内样本足用桶内分，否则退回全局分。"""
+    if not pstats:
+        return None
+    return perf_score_bucket(pstats, bucket_key(now_ms)) or perf_score(pstats)
+
+
+TINY_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+
+def probe_model(key, model, images=False, timeout=90):
+    """Tiny probe request: True = healthy (200). Used for early pause-recovery
+    detection and proactive image-capability discovery."""
+    if images:
+        content = [{"type": "text", "text": "这张图是什么颜色"},
+                   {"type": "image_url", "image_url": {"url": TINY_PNG}}]
+    else:
+        content = "ping"
+    payload = {"model": model, "messages": [{"role": "user", "content": content}],
+               "max_tokens": 16, "stream": False}
+    req = urllib.request.Request(GATEWAY, data=json.dumps(payload).encode(), headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + key,
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 def ai_candidates(args, success, available, perf=None):
     """Ordered classification-model candidates: explicit override first, then
     体验分排序（稳定且快者优先），再按最近成功，最后任意可用。"""
@@ -969,8 +1020,13 @@ def main():
         pstats = perf.setdefault(model_key, {"samples": 0, "consecFails": 0, "ewmaTps": None, "ewmaTtfbMs": None, "lastAt": 0})
         pstats["lastAt"] = now_ms
         pstats["samples"] = int(pstats.get("samples") or 0) + 1
+        bkey = bucket_key(now_ms)
+        pbuckets = pstats.setdefault("buckets", {})
+        pb = pbuckets.setdefault(bkey, {"samples": 0, "ewmaTps": None, "ewmaTtfbMs": None, "consecFails": 0})
+        pb["samples"] = int(pb.get("samples") or 0) + 1
         if status == 200:
             pstats["consecFails"] = 0
+            pb["consecFails"] = 0
             out_n = row.get("out")
             ms_n = row.get("ms")
             ttft = row.get("ttft_ms")
@@ -978,11 +1034,16 @@ def main():
                 tps = out_n / ms_n * 1000
                 prev = pstats.get("ewmaTps")
                 pstats["ewmaTps"] = round(tps, 1) if prev is None else round(prev * 0.7 + tps * 0.3, 1)
+                prevb = pb.get("ewmaTps")
+                pb["ewmaTps"] = round(tps, 1) if prevb is None else round(prevb * 0.7 + tps * 0.3, 1)
             if isinstance(ttft, (int, float)) and ttft > 0:
                 prev = pstats.get("ewmaTtfbMs")
                 pstats["ewmaTtfbMs"] = round(ttft) if prev is None else round(prev * 0.7 + ttft * 0.3)
+                prevb = pb.get("ewmaTtfbMs")
+                pb["ewmaTtfbMs"] = round(ttft) if prevb is None else round(prevb * 0.7 + ttft * 0.3)
         elif isinstance(status, int) and status >= 400:
             pstats["consecFails"] = int(pstats.get("consecFails") or 0) + 1
+            pb["consecFails"] = int(pb.get("consecFails") or 0) + 1
 
         # A 200 from real traffic is the strongest recovery signal: clear any
         # fresh pause right away and reset the backoff counter (minimal
@@ -1115,6 +1176,45 @@ def main():
         if isinstance(cur, dict) and cur.get("state") == "bad" and (now_ms - (cur.get("at") or 0)) >= args.ttl:
             del images[key]
 
+    # ── 主动探测（probes）：早恢复发现 + 能力主动试探，替代被动等流量 ──
+    # 每轮最多 3 个探针（真实小请求，成本可控）。
+    if args.auto_tune and not args.dry_run and key:
+        probes = 0
+        # (a) pause 早恢复探测：熔断过半即主动试探，200 则提前解除
+        for a in list(actions):
+            if probes >= 3:
+                break
+            if a.get("kind") == "pause":
+                elapsed = now_ms - (a.get("at") or 0)
+                if elapsed > (a.get("ttlMs") or 0) * 0.5 and probe_model(key, a.get("model"), images=False):
+                    actions.remove(a)
+                    fails[a.get("model")] = 0
+                    perf_model = perf.get(a.get("model"))
+                    if perf_model:
+                        perf_model["consecFails"] = 0
+                    updates[a.get("model")] = {"kind": "resume-probe"}
+                    log("probe: %s 提前恢复（熔断解除）" % a.get("model"), args.quiet)
+                    probes += 1
+        # (b) 图片能力主动试探：未知能力的候选主动发小图确认，
+        #     把"未知→试错等真实流量"缩短为"本轮即知"。
+        for rule in options.get("rules") or []:
+            if probes >= 3:
+                break
+            if rule.get("type") != "images":
+                continue
+            for m in [rule.get("target")] + list(rule.get("fallbacks") or []):
+                if probes >= 3 or not m:
+                    continue
+                img = images.get(m)
+                unknown = not img
+                expired_bad = isinstance(img, dict) and img.get("state") == "bad" and (now_ms - (img.get("at") or 0)) >= args.ttl
+                if unknown or expired_bad:
+                    ok = probe_model(key, m, images=True)
+                    images[m] = {"state": "good" if ok else "bad", "at": now_ms}
+                    updates[m] = {"kind": "probe-images"}
+                    log("probe: %s 图片能力=%s（主动试探）" % (m, "可用" if ok else "不可用"), args.quiet)
+                    probes += 1
+
     # ── 周期反思：审视学到的状态，发现过时/矛盾/覆盖缺口 ──
     insights = reflect_on_state(options.get("rules") or [], images, actions, perf, fails,
                                 state.get("ignore_sigs") or {}, now_ms, args.ttl)
@@ -1145,6 +1245,7 @@ def main():
     # ── 体验自适应：按实测评分重排 images 规则的候选顺序（迟滞防抖）──
     # 稳定（无连败）且吞吐率高者优先；现任与挑战者差距 <15% 不换（防抖）。
     options_dirty = False
+    cur_bkey = bucket_key(now_ms)
     for rule in options.get("rules") or []:
         if rule.get("type") != "images":
             continue
@@ -1153,7 +1254,7 @@ def main():
         scored = []
         for i, m in enumerate(cands):
             pstats = perf.get(m)
-            s = perf_score(pstats) if pstats and (pstats.get("samples") or 0) >= 2 else None
+            s = perf_score_now(pstats, now_ms) if pstats and (pstats.get("samples") or 0) >= 2 else None
             scored.append((m, s))
         known_scored = [x for x in scored if x[1] is not None]
         if not known_scored or len(cands) < 2:
