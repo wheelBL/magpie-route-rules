@@ -1,178 +1,176 @@
-// 路由规则学习全景页：读插件自身 options 的 learnedView（伴生每 5 分钟刷新），
-// 每 30 秒自动重读。全部数据来自 options.learned / options.learnedView，
-// 不发任何网络请求（页面沙盒 connect-src 'none'）。
+// 路由规则学习页（重设计版）：读 options.learnedView 渲染。
+// 数据经 magpie bridge 获取，页面沙盒内无任何网络请求。
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]))
 }
 
+function el(tag, cls, text) {
+  const e = document.createElement(tag)
+  if (cls) e.className = cls
+  if (text != null) e.textContent = text
+  return e
+}
+
 function render(o) {
   const lv = (o && o.learnedView) || null
-  const meta = document.getElementById('meta')
-  meta.textContent = lv
-    ? '数据时间 ' + esc(lv.generatedAt) + ' · 伴生 route-learn 每 5 分钟刷新 · 本页每 30 秒重读'
-    : '尚无 learnedView —— 请确认 tools/route-learn.py ≥ 0.3.15 且学习计划任务已运行过一轮'
+  document.getElementById('meta').textContent = lv
+    ? '数据时间 ' + lv.generatedAt + ' · 伴生每 5 分钟刷新 · 本页每 30 秒重读'
+    : '尚无 learnedView —— 请确认 tools/route-learn.py ≥ 0.3.15 且学习任务已运行'
 
-  // 插件效果
-  const imp = document.getElementById('impact')
-  imp.textContent = ''
+  // ── 效果 KPI ──
+  const impBox = document.getElementById('impact')
+  impBox.textContent = ''
   const im = lv && lv.impact
   if (!im) {
-    const p = document.createElement('p')
-    p.className = 'muted'
-    p.textContent = '统计中（伴生每小时重算 7 天窗口，首轮运行后显示）'
-    imp.appendChild(p)
+    impBox.appendChild(el('p', 'empty', '统计中（伴生每小时重算，首轮运行后显示）'))
   } else {
-    const big = document.createElement('div')
-    const items = [
-      ['可用度', im.availability + '%', '估计无插件 ' + (im.availabilityNoPlugin != null ? im.availabilityNoPlugin + '%' : '—')],
-      ['自动挽救', im.saves + ' 次', '透明切换后成功（预算/流/链）'],
-      ['请求总数', im.requests + ' (' + im.windowDays + '天)', '排除伴生自身流量'],
-      ['首字节中位', im.medianTtftS != null ? im.medianTtftS + 's' : '—', '耗时中位 ' + (im.medianDurationS != null ? im.medianDurationS + 's' : '—')],
+    document.getElementById('impactSub').textContent = im.windowDays + ' 天滚动 · 排除伴生流量'
+    const cards = [
+      { cls: 'good', label: '可用度', value: im.availability != null ? im.availability : '—', unit: '%',
+        delta: im.availabilityNoPlugin != null ? ['无插件估计', im.availabilityNoPlugin + '%', Math.max(0, im.availability - im.availabilityNoPlugin)] : null },
+      { cls: 'warn', label: '自动挽救', value: im.saves != null ? im.saves : '—', unit: ' 次',
+        delta: ['透明切换后成功', null, null] },
+      { cls: '', label: '请求总数', value: im.requests != null ? im.requests : '—', unit: ' (' + im.windowDays + 'd)',
+        delta: ['失败 ' + Math.max(0, Math.round((im.requests || 0) * (1 - (im.availability || 100) / 100))) + ' 次', null, null] },
+      { cls: '', label: '首字节中位', value: im.medianTtftS != null ? im.medianTtftS : '—', unit: 's',
+        delta: ['总耗时中位 ' + (im.medianDurationS != null ? im.medianDurationS + 's' : '—'), null, null] },
     ]
-    for (const [k, v, sub] of items) {
-      const b = document.createElement('div')
-      b.style.display = 'inline-block'
-      b.style.margin = '8px 18px 8px 0'
-      b.style.verticalAlign = 'top'
-      const t = document.createElement('div')
-      t.className = 'muted'
-      t.style.fontSize = '12px'
-      t.textContent = k
-      const n = document.createElement('div')
-      n.style.fontSize = '22px'
-      n.style.fontWeight = '600'
-      n.textContent = v
-      const s = document.createElement('div')
-      s.className = 'muted'
-      s.style.fontSize = '11px'
-      s.textContent = sub
-      b.append(t, n, s)
-      big.appendChild(b)
+    for (const c of cards) {
+      const card = el('div', 'kpi ' + (c.cls || ''))
+      card.appendChild(el('div', 'label', c.label))
+      const v = el('div', 'value')
+      v.textContent = String(c.value)
+      if (c.unit) {
+        const u = el('small', null, c.unit)
+        u.textContent = ' ' + c.unit
+        v.appendChild(u)
+      }
+      card.appendChild(v)
+      if (c.delta) {
+        const d = el('div', 'delta')
+        if (c.delta[2] != null && c.delta[2] > 0) {
+          d.append(c.delta[0] + ' ')
+          const b = el('b', null, '+' + (Math.round(c.delta[2] * 10) / 10) + '%')
+          d.appendChild(b)
+        } else {
+          d.textContent = c.delta[0]
+        }
+        card.appendChild(d)
+      }
+      impBox.appendChild(card)
     }
-    imp.appendChild(big)
-    const detail = im.savesDetail || {}
-    const keys = Object.keys(detail)
+    const det = im.savesDetail || {}
+    const keys = Object.keys(det)
     if (keys.length) {
-      const p = document.createElement('p')
-      p.className = 'muted'
-      p.textContent = '切换明细：' + keys.map((k) => k + ' ×' + detail[k]).join('，')
-      imp.appendChild(p)
+      const sub = el('p', 'meta', '切换明细：' + keys.map((k) => k + ' ×' + det[k]).join('，'))
+      sub.style.margin = '10px 0 0'
+      impBox.appendChild(sub)
     }
   }
 
-  // 性能画像
-  const tbody = document.querySelector('#perf')
-  tbody.textContent = ''
+  // ── 模型优先级 ──
+  const perf = document.getElementById('perf')
+  perf.textContent = ''
   const rows = (lv && lv.perfSummary) || []
   if (!rows.length) {
-    const tr = document.createElement('tr')
-    const td = document.createElement('td')
-    td.colSpan = 6
-    td.className = 'muted'
-    td.textContent = '暂无采样（伴生扫描尚未积累）'
-    tr.appendChild(td)
-    tbody.appendChild(tr)
+    perf.appendChild(el('p', 'empty', '暂无采样（伴生扫描尚未积累）'))
   }
-  for (const e of rows) {
-    const tr = document.createElement('tr')
-    const ttfS = e.ttfS != null ? e.ttfS : (e.ttfMs != null ? Math.round(e.ttfMs / 100) / 10 : null)
-    const cells = [
-      [esc(e.model) + (e.degraded ? ' ⚠ ' + esc(e.degraded) + ' 降级' : ''), ''],
-      [e.score != null ? e.score : '采样不足', 'num'],
-      [e.tps != null ? e.tps : '—', 'num'],
-      [ttfS != null ? ttfS + 's' : '—', 'num'],
-      [e.samples != null ? e.samples : 0, 'num'],
-      [e.consecFails != null ? e.consecFails : 0, 'num'],
-    ]
-    for (const [text, cls] of cells) {
-      const td = document.createElement('td')
-      if (cls) td.className = cls
-      td.textContent = text
-      tr.appendChild(td)
+  const maxScore = Math.max(1, ...rows.map((e) => e.score || 0))
+  rows.forEach((e, i) => {
+    const m = el('div', 'model' + (i === 0 ? ' first' : ''))
+    m.appendChild(el('div', 'rank', String(i + 1)))
+    const nm = el('div', 'name', e.model)
+    if (e.degraded) {
+      const dg = el('span', 'deg', '⚠ ' + e.degraded + ' 降级')
+      nm.appendChild(dg)
     }
-    tbody.appendChild(tr)
-  }
+    m.appendChild(nm)
+    const bar = el('div', 'bar')
+    const fill = el('i')
+    fill.style.width = Math.round(100 * (e.score || 0) / maxScore) + '%'
+    bar.appendChild(fill)
+    m.appendChild(bar)
+    const s1 = el('div', 'stat')
+    s1.appendChild(el('b', null, e.score != null ? e.score : '—'))
+    s1.appendChild(el('span', null, '评分'))
+    m.appendChild(s1)
+    const s2 = el('div', 'stat')
+    s2.appendChild(el('b', null, e.ttfS != null ? e.ttfS + 's' : (e.ttfMs != null ? (Math.round(e.ttfMs / 100) / 10) + 's' : '—')))
+    s2.appendChild(el('span', null, '首字节'))
+    m.appendChild(s2)
+    const s3 = el('div', 'stat')
+    s3.appendChild(el('b', null, String(e.samples ?? 0)))
+    s3.appendChild(el('span', null, '采样'))
+    m.appendChild(s3)
+    perf.appendChild(m)
+  })
 
-  // 反思洞察
+  // ── 洞察 ──
   const ins = document.getElementById('insights')
   ins.textContent = ''
   const list = (lv && lv.insights) || []
   if (!list.length) {
-    const p = document.createElement('p')
-    p.className = 'muted'
-    p.textContent = '当前状态健康，无待关注事项'
-    ins.appendChild(p)
+    ins.appendChild(el('p', 'empty', '当前状态健康，无待关注事项'))
   }
   for (const i of list) {
-    const p = document.createElement('p')
-    const badge = document.createElement('span')
-    badge.className = 'badge ' + esc(i.level)
-    badge.textContent = i.level
-    p.appendChild(badge)
-    p.appendChild(document.createTextNode(i.text))
-    ins.appendChild(p)
+    const d = el('div', 'insight ' + esc(i.level))
+    const lv2 = el('span', 'lv', i.level)
+    d.appendChild(lv2)
+    d.appendChild(document.createTextNode(i.text))
+    ins.appendChild(d)
   }
 
-  // 图片能力
+  // ── 图片能力 ──
   const imgs = document.getElementById('images')
   imgs.textContent = ''
   const iv = (lv && lv.imagesView) || {}
-  const keys = Object.keys(iv)
-  if (!keys.length) {
-    const p = document.createElement('p')
-    p.className = 'muted'
-    p.textContent = '无标记（候选按未知能力对待，允许试探；探针会主动确认）'
-    imgs.appendChild(p)
+  const ikeys = Object.keys(iv)
+  if (!ikeys.length) {
+    imgs.appendChild(el('p', 'empty', '无标记（候选按未知能力对待，探针会主动确认）'))
   }
-  for (const m of keys) {
-    const p = document.createElement('p')
-    const name = document.createElement('span')
-    name.textContent = m + ': '
-    const st = document.createElement('span')
-    const state = iv[m].state
-    st.className = state === 'good' ? 'good' : state === 'bad' ? 'bad' : ''
-    st.textContent = state === 'good' ? '可用' : state === 'bad' ? '不可用' : String(state)
-    const age = document.createElement('span')
-    age.className = 'muted'
-    age.textContent = '（' + iv[m].ageMin + ' 分钟前标记）'
-    p.append(name, st, age)
-    imgs.appendChild(p)
+  for (const k of ikeys) {
+    const r = el('div', 'row')
+    const st = iv[k].state
+    r.appendChild(el('span', 'dot ' + (st === 'good' ? 'ok' : st === 'bad' ? 'bad' : 'none')))
+    r.appendChild(el('span', 'nm', k))
+    r.appendChild(el('span', 'tag', st === 'good' ? '可用' : st === 'bad' ? '不可用' : String(st)))
+    r.appendChild(el('span', 'ago', iv[k].ageMin + ' 分钟前'))
+    imgs.appendChild(r)
   }
 
-  // 动作
+  // ── 动作 ──
   const acts = document.getElementById('actions')
   acts.textContent = ''
   const av = (lv && lv.actionsView) || []
   if (!av.length) {
-    const p = document.createElement('p')
-    p.className = 'muted'
-    p.textContent = '无执行中动作'
-    acts.appendChild(p)
+    acts.appendChild(el('p', 'empty', '无执行中动作'))
   }
   for (const a of av) {
-    const p = document.createElement('p')
-    p.textContent = a.model + ': ' + a.kind + '（剩 ' + a.leftMin + ' 分钟，by=' + (a.by || '') + '）'
-    acts.appendChild(p)
+    const r = el('div', 'row')
+    r.appendChild(el('span', 'dot ' + (a.kind === 'pause' ? 'bad' : 'warn')))
+    r.appendChild(el('span', 'nm', a.model))
+    r.appendChild(el('span', 'tag', a.kind))
+    r.appendChild(el('span', 'ago', '剩 ' + a.leftMin + ' 分钟 · ' + (a.by || '')))
+    acts.appendChild(r)
   }
 
-  // 深度反思
+  // ── AI 反思 ──
   const rf = document.getElementById('reflect')
   rf.textContent = ''
   const lrc = lv && lv.lastReflect
   if (!lrc) {
-    const p = document.createElement('p')
-    p.className = 'muted'
-    p.textContent = '尚未运行 AI 深度反思（tools/route-learn.py --reflect）'
-    rf.appendChild(p)
+    rf.appendChild(el('p', 'empty', '尚未运行（自动每日一次，或手动 tools/route-learn.py --reflect）'))
   } else {
-    const m = document.createElement('p')
-    m.className = 'meta'
-    m.textContent = (lrc.model || '') + ' · ' + (lrc.at ? new Date(lrc.at).toLocaleString() : '')
-    const pre = document.createElement('pre')
-    pre.textContent = lrc.text || ''
-    rf.append(m, pre)
+    const box = el('div', 'reflect')
+    const head = el('div', 'head')
+    const left = el('span', null, lrc.model || '')
+    const right = el('span', null, lrc.at ? new Date(lrc.at).toLocaleString() : '')
+    head.append(left, right)
+    box.appendChild(head)
+    box.appendChild(el('pre', null, lrc.text || ''))
+    rf.appendChild(box)
   }
 }
 
