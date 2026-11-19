@@ -29,11 +29,12 @@ function render(o) {
   }
   for (const e of rows) {
     const tr = document.createElement('tr')
+    const ttfS = e.ttfS != null ? e.ttfS : (e.ttfMs != null ? Math.round(e.ttfMs / 100) / 10 : null)
     const cells = [
       [esc(e.model) + (e.degraded ? ' ⚠ ' + esc(e.degraded) + ' 降级' : ''), ''],
       [e.score != null ? e.score : '采样不足', 'num'],
       [e.tps != null ? e.tps : '—', 'num'],
-      [e.ttfMs != null ? e.ttfMs + 'ms' : '—', 'num'],
+      [ttfS != null ? ttfS + 's' : '—', 'num'],
       [e.samples != null ? e.samples : 0, 'num'],
       [e.consecFails != null ? e.consecFails : 0, 'num'],
     ]

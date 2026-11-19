@@ -582,7 +582,9 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
     perf_summary = []
     for m, p in perf.items():
         s = perf_score_now(p, now_ms)
-        e0 = {"model": m, "score": s, "tps": p.get("ewmaTps"), "ttfMs": p.get("ewmaTtfbMs"),
+        ttf_ms0 = p.get("ewmaTtfbMs")
+        e0 = {"model": m, "score": s, "tps": p.get("ewmaTps"),
+              "ttfS": round(ttf_ms0 / 1000, 1) if isinstance(ttf_ms0, (int, float)) else None,
               "samples": p.get("samples"), "consecFails": p.get("consecFails")}
         if p.get("capabilityDegraded"):
             e0["degraded"] = p["capabilityDegraded"]
@@ -887,7 +889,7 @@ def main():
             perf_rows.sort(key=lambda t: (-(t[2] if t[2] is not None else -1)))
             for m, p, s, img_bad in perf_rows:
                 tps = "%.1f" % p["ewmaTps"] if p.get("ewmaTps") is not None else "-"
-                ttfb = "%.0fms" % p["ewmaTtfbMs"] if p.get("ewmaTtfbMs") is not None else "-"
+                ttfb = "%.1fs" % (p["ewmaTtfbMs"] / 1000) if p.get("ewmaTtfbMs") is not None else "-"
                 score = "%.1f" % s if s is not None else "采样不足"
                 extra = " | 图片暂不可用" if img_bad else ""
                 print("  %s: 评分 %s | %.1f tok/s | 首字节 %s | 连败 %d | 采样 %d%s" % (
