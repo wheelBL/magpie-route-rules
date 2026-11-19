@@ -1235,6 +1235,18 @@ def main():
             print(narrative)
             state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:2000]}
 
+    # ── 能力标记 → 性能画像联动（capabilityDegraded）──
+    # images bad（新鲜）→ 该模型能力降级。文本流量会持续清零 consecFails，
+    # 只看连败计数会把图片能力缺陷藏在健康假象后面——独立字段让降级在
+    # 画像中显式可见，供 --learned 展示、AI 反思与重排联动消费。
+    for m, pstats in perf.items():
+        img = images.get(m)
+        degraded = isinstance(img, dict) and img.get("state") == "bad" and (now_ms - (img.get("at") or 0)) < args.ttl
+        if degraded:
+            pstats["capabilityDegraded"] = "images"
+        else:
+            pstats.pop("capabilityDegraded", None)
+
     state["success"] = success
     state["fails"] = fails
     perf_bounded = dict(sorted(perf.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:30])
@@ -1252,9 +1264,16 @@ def main():
         cands = [rule.get("target")] + list(rule.get("fallbacks") or [])
         cands = [m for m in cands if m]
         scored = []
-        for i, m in enumerate(cands):
+        for m in cands:
             pstats = perf.get(m)
-            s = perf_score_now(pstats, now_ms) if pstats and (pstats.get("samples") or 0) >= 2 else None
+            if pstats and (pstats.get("samples") or 0) >= 2:
+                s = perf_score_now(pstats, now_ms)
+                # 能力标记 → 路由可用性联动：能力降级的成员在此类规则中大幅降权
+                # （capabilityDegraded 类型与规则类型一致才降权——images 降级只影响 images 规则）
+                if s is not None and pstats.get("capabilityDegraded") == rule.get("type"):
+                    s = round(s * 0.1, 1)
+            else:
+                s = None
             scored.append((m, s))
         known_scored = [x for x in scored if x[1] is not None]
         if not known_scored or len(cands) < 2:
