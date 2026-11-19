@@ -577,6 +577,33 @@ def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_
     return ai_chat(messages, args, candidates, max_tokens=800)
 
 
+def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
+    """人读视图：伴生写进 options.learnedView，magpie 插件页渲染。"""
+    perf_summary = []
+    for m, p in perf.items():
+        s = perf_score_now(p, now_ms)
+        e0 = {"model": m, "score": s, "tps": p.get("ewmaTps"), "ttfMs": p.get("ewmaTtfbMs"),
+              "samples": p.get("samples"), "consecFails": p.get("consecFails")}
+        if p.get("capabilityDegraded"):
+            e0["degraded"] = p["capabilityDegraded"]
+        perf_summary.append(e0)
+    perf_summary.sort(key=lambda e: -(e["score"] if e["score"] is not None else -1))
+    view = {
+        "generatedAt": time.strftime("%Y-%m-%d %H:%M"),
+        "perfSummary": perf_summary[:8],
+        "insights": insights[:10],
+        "imagesView": {m: {"state": v.get("state"), "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
+                       for m, v in images.items()},
+        "actionsView": [{"model": a.get("model"), "kind": a.get("kind"),
+                         "leftMin": max(0, round(((a.get("at") or 0) + (a.get("ttlMs") or 0) - now_ms) / 60000)),
+                         "by": a.get("by")} for a in actions],
+    }
+    if last_reflect:
+        view["lastReflect"] = {"at": last_reflect.get("at"), "model": last_reflect.get("model"),
+                               "text": str(last_reflect.get("text") or "")[:800]}
+    return view
+
+
 def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, image_ttl_ms):
     """周期性自省：审视学到的状态，发现过时、矛盾、覆盖缺口。
     返回 insights 列表 [{level: warn|info|suggest, text}]。"""
@@ -944,12 +971,35 @@ def main():
         state["diag"]["lastRunAt"] = int(time.time() * 1000)
         atomic_write_json(args.state, state)
 
+    def refresh_quiet_view(now0):
+        """无新行/无 usage 文件也要刷新 learnedView：历史数据已在 state 与
+        options.learned 里，静默机器（offset 已到末尾、暂无新流量）同样
+        能在 GUI 看到学习全景——首装 0.3.16 后"尚无 learnedView"的根因。"""
+        try:
+            learned0 = options.get("learned") or {}
+            images0 = learned0.get("images") or {}
+            actions0 = learned0.get("actions") or []
+            perf0 = state.get("perf") or {}
+            insights0 = reflect_on_state(options.get("rules") or [], images0, actions0, perf0,
+                                         state.get("fails") or {}, state.get("ignore_sigs") or {}, now0, args.ttl)
+            view0 = build_learned_view(perf0, images0, actions0, insights0, state.get("lastReflect"), now0)
+            if view0 != options.get("learnedView"):
+                backup(args.plugins)
+                options["learned"] = {"images": images0, "actions": actions0}
+                options["learnedView"] = view0
+                entry["options"] = options
+                atomic_write_json(args.plugins, plugins)
+                log("learnedView 已刷新（静默路径，无新行）", args.quiet)
+        except Exception as err:
+            log("learnedView 静默刷新失败：%s" % err, args.quiet)
+
     now_ms = int(time.time() * 1000)
     if not os.path.exists(args.usage):
         reason = "usage 文件不存在：%s（检查 magpie 配置目录是否在 ~/.config/magpie）" % args.usage
         log(reason, args.quiet)
         state["diag"] = {"reason": reason, "at": now_ms}
         save_state()
+        refresh_quiet_view(now_ms)
         return 0
     size = os.path.getsize(args.usage)
     offset = state["offset"] if size >= state["offset"] else 0
@@ -961,6 +1011,7 @@ def main():
     if "\n" not in text:
         state["diag"] = {"reason": "无完整新行（offset=%d, size=%d）" % (offset, size), "at": now_ms}
         save_state()
+        refresh_quiet_view(now_ms)
         log("无完整新行（offset=%d）" % offset, args.quiet)
         return 0
     lines = text.split("\n")
@@ -1304,29 +1355,7 @@ def main():
 
     # ── GUI 可见性：人读视图写进 options.learnedView（magpie 插件页直接可看）──
     # learnedView 是功能性 learned 的兄弟键：中间件只读 learned.*，不受影响。
-    perf_summary = []
-    for m, p in perf.items():
-        s = perf_score_now(p, now_ms)
-        e0 = {"model": m, "score": s, "tps": p.get("ewmaTps"), "ttfMs": p.get("ewmaTtfbMs"),
-              "samples": p.get("samples"), "consecFails": p.get("consecFails")}
-        if p.get("capabilityDegraded"):
-            e0["degraded"] = p["capabilityDegraded"]
-        perf_summary.append(e0)
-    perf_summary.sort(key=lambda e: -(e["score"] if e["score"] is not None else -1))
-    learned_view = {
-        "generatedAt": time.strftime("%Y-%m-%d %H:%M"),
-        "perfSummary": perf_summary[:8],
-        "insights": insights[:10],
-        "imagesView": {m: {"state": v.get("state"), "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
-                       for m, v in images.items()},
-        "actionsView": [{"model": a.get("model"), "kind": a.get("kind"),
-                         "leftMin": max(0, round(((a.get("at") or 0) + (a.get("ttlMs") or 0) - now_ms) / 60000)),
-                         "by": a.get("by")} for a in actions],
-    }
-    lr = state.get("lastReflect")
-    if lr:
-        learned_view["lastReflect"] = {"at": lr.get("at"), "model": lr.get("model"),
-                                       "text": str(lr.get("text") or "")[:800]}
+    learned_view = build_learned_view(perf, images, actions, insights, state.get("lastReflect"), now_ms)
     view_changed = learned_view != options.get("learnedView")
     changed = actions != (learned.get("actions") if isinstance(learned.get("actions"), list) else []) \
         or images != (learned.get("images") if isinstance(learned.get("images"), dict) else {}) \
