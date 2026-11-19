@@ -1302,11 +1302,39 @@ def main():
             json.dumps(updates), len(actions), json.dumps(images), new_offset, ai_used, json.dumps(fails)), args.quiet)
         return 0
 
+    # ── GUI 可见性：人读视图写进 options.learnedView（magpie 插件页直接可看）──
+    # learnedView 是功能性 learned 的兄弟键：中间件只读 learned.*，不受影响。
+    perf_summary = []
+    for m, p in perf.items():
+        s = perf_score_now(p, now_ms)
+        e0 = {"model": m, "score": s, "tps": p.get("ewmaTps"), "ttfMs": p.get("ewmaTtfbMs"),
+              "samples": p.get("samples"), "consecFails": p.get("consecFails")}
+        if p.get("capabilityDegraded"):
+            e0["degraded"] = p["capabilityDegraded"]
+        perf_summary.append(e0)
+    perf_summary.sort(key=lambda e: -(e["score"] if e["score"] is not None else -1))
+    learned_view = {
+        "generatedAt": time.strftime("%Y-%m-%d %H:%M"),
+        "perfSummary": perf_summary[:8],
+        "insights": insights[:10],
+        "imagesView": {m: {"state": v.get("state"), "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
+                       for m, v in images.items()},
+        "actionsView": [{"model": a.get("model"), "kind": a.get("kind"),
+                         "leftMin": max(0, round(((a.get("at") or 0) + (a.get("ttlMs") or 0) - now_ms) / 60000)),
+                         "by": a.get("by")} for a in actions],
+    }
+    lr = state.get("lastReflect")
+    if lr:
+        learned_view["lastReflect"] = {"at": lr.get("at"), "model": lr.get("model"),
+                                       "text": str(lr.get("text") or "")[:800]}
+    view_changed = learned_view != options.get("learnedView")
     changed = actions != (learned.get("actions") if isinstance(learned.get("actions"), list) else []) \
-        or images != (learned.get("images") if isinstance(learned.get("images"), dict) else {})
+        or images != (learned.get("images") if isinstance(learned.get("images"), dict) else {}) \
+        or view_changed
     if changed:
         backup(args.plugins)
         options["learned"] = {"images": images, "actions": actions}
+        options["learnedView"] = learned_view
         entry["options"] = options
         atomic_write_json(args.plugins, plugins)
         log("已写入学习结果：actions=%d images=%s ai=%d%s" % (
