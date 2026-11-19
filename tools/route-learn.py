@@ -1285,6 +1285,26 @@ def main():
             print("（反思模型：%s）" % used)
             print(narrative)
             state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:2000]}
+        state["lastAiReflectAt"] = now_ms
+
+    # ── AI 深度反思自动触发：距上次 ≥24h 且本轮有新内容 ──
+    # 触发条件=洞察 or 学习更新 or 本轮扫过新流量行（AI 反思的价值包括
+    # 从数据发现规则没覆盖的趋势，不等规则洞察非空）；完全无流量才跳过。
+    elif not args.no_ai and not args.dry_run and key:
+        last_ar = state.get("lastAiReflectAt") or 0
+        if (now_ms - last_ar) >= 24 * 3600 * 1000 and (insights or updates or scan_diag.get("scanned")):
+            try:
+                available = fetch_available_models(key)
+                candidates = ai_candidates(args, success, available, perf)
+                recent_rows_text = "\n".join(lines[-max(1, args.explain_rows):])
+                narrative, used, err = ai_deep_reflect(args, perf, success, images, actions,
+                                                       insights, recent_rows_text, candidates)
+                if narrative:
+                    state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:2000]}
+                    log("AI 深度反思自动完成（%s）——洞察 %d 条" % (used, len(insights)), args.quiet)
+                state["lastAiReflectAt"] = now_ms
+            except Exception as err:
+                log("AI 深度反思自动触发失败：%s" % err, args.quiet)
 
     # ── 能力标记 → 性能画像联动（capabilityDegraded）──
     # images bad（新鲜）→ 该模型能力降级。文本流量会持续清零 consecFails，
