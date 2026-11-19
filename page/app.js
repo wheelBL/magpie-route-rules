@@ -61,13 +61,6 @@ function render(o) {
       }
       impBox.appendChild(card)
     }
-    const det = im.savesDetail || {}
-    const keys = Object.keys(det)
-    if (keys.length) {
-      const sub = el('p', 'meta', '切换明细：' + keys.map((k) => k + ' ×' + det[k]).join('，'))
-      sub.style.margin = '10px 0 0'
-      impBox.appendChild(sub)
-    }
   }
 
   // ── 模型优先级 ──
@@ -96,6 +89,10 @@ function render(o) {
     s1.appendChild(el('b', null, e.score != null ? e.score : '—'))
     s1.appendChild(el('span', null, '评分'))
     m.appendChild(s1)
+    const s1b = el('div', 'stat')
+    s1b.appendChild(el('b', null, e.tps != null ? e.tps : '—'))
+    s1b.appendChild(el('span', null, 'tok/s'))
+    m.appendChild(s1b)
     const s2 = el('div', 'stat')
     s2.appendChild(el('b', null, e.ttfS != null ? e.ttfS + 's' : (e.ttfMs != null ? (Math.round(e.ttfMs / 100) / 10) + 's' : '—')))
     s2.appendChild(el('span', null, '首字节'))
