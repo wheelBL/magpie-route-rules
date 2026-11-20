@@ -201,7 +201,10 @@ def fetch_available_models(key):
 
 
 def _ttfb_penalty(pstats):
-    """首字节时延惩罚因子：10s TTFB 减半分数（体感 = 吞吐 × 响应及时性）。"""
+    """首字节时延惩罚因子：10s TTFB 减半分数（体感 = 吞吐 × 响应及时性）。
+    TTFB 样本 <3 不惩罚（数据不足时不臆断——反思建议的样本门槛）。"""
+    if (pstats.get("ttfbSamples") or 0) < 3:
+        return 1.0
     ttfb = pstats.get("ewmaTtfbMs")
     if not isinstance(ttfb, (int, float)) or ttfb <= 0:
         return 1.0
@@ -783,6 +786,15 @@ def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, i
             insights.append({"level": "info",
                              "text": "%s 性能样本已 %.0f 小时未更新（无流量或采集停滞，评分可能不反映现状）"
                                      % (m, age_h)})
+    # 2d. 桶级失败集中（反思建议"桶级失败上卷"）：某时段桶失败 ≥3 且样本 ≥5
+    #     = 失败在特定时段聚集（如晚高峰），全局均值会掩盖它。
+    for m, p in perf.items():
+        for bkey, b in (p.get("buckets") or {}).items():
+            bf, bs = b.get("fails") or 0, b.get("samples") or 0
+            if bf >= 3 and bs >= 5:
+                insights.append({"level": "warn",
+                                 "text": "%s 在 %s 时段失败集中（%d/%d）——该时段应自动降权，持续则人工检查"
+                                         % (m, bucket_label(bkey), bf, bs)})
     # 3. 从未被试探的候选：能力未知（可能是从未有过带图/该类流量的模型）
     unsampled = [m for m, p in perf.items() if int(p.get("samples") or 0) == 0]
     if unsampled:
@@ -1193,6 +1205,7 @@ def main():
                 return a
         return None
 
+    window_fails = {}
     for line in lines:
         if not line.strip():
             continue
@@ -1233,6 +1246,10 @@ def main():
             out_n = row.get("out")
             ms_n = row.get("ms")
             ttft = row.get("ttft_ms")
+            # TTFB 画像补齐（反思建议）：非流式行无 ttft_ms 时用总耗时当首字节样本——
+            # 非流式下用户等的正是全程，ms 即体感知等待。
+            if not (isinstance(ttft, (int, float)) and ttft > 0) and isinstance(ms_n, (int, float)) and ms_n > 0:
+                ttft = ms_n
             if isinstance(out_n, (int, float)) and out_n > 0 and isinstance(ms_n, (int, float)) and ms_n > 0:
                 tps = out_n / ms_n * 1000
                 prev = pstats.get("ewmaTps")
@@ -1245,11 +1262,18 @@ def main():
             if isinstance(ttft, (int, float)) and ttft > 0:
                 prev = pstats.get("ewmaTtfbMs")
                 pstats["ewmaTtfbMs"] = round(ttft) if prev is None else round(prev * 0.7 + ttft * 0.3)
+                pstats["ttfbSamples"] = int(pstats.get("ttfbSamples") or 0) + 1
                 prevb = pb.get("ewmaTtfbMs")
                 pb["ewmaTtfbMs"] = round(ttft) if prevb is None else round(prevb * 0.7 + ttft * 0.3)
+                pb["ttfbSamples"] = int(pb.get("ttfbSamples") or 0) + 1
         elif isinstance(status, int) and status >= 400:
             pstats["consecFails"] = int(pstats.get("consecFails") or 0) + 1
             pb["consecFails"] = int(pb.get("consecFails") or 0) + 1
+            # 桶级失败上卷（反思建议）：失败按时段桶计数，供"失败集中"洞察
+            pb["fails"] = int(pb.get("fails") or 0) + 1
+            # 重试风暴感知（反思建议）：DSH 端一次失败会连发 5 次重试——
+            # 同模型同窗口 ≥3 次失败 = 一次用户疼痛事件，应比散布失败更重。
+            window_fails[model_key] = int(window_fails.get(model_key) or 0) + 1
 
         # A 200 from real traffic is the strongest recovery signal: clear any
         # fresh pause right away and reset the backoff counter (minimal
@@ -1368,6 +1392,12 @@ def main():
             scan_diag["rowErrors"] = scan_diag.get("rowErrors", 0) + 1
             log("行学习失败（%s）：%s" % (model_key, err), args.quiet)
             continue
+
+    # ── 重试风暴感知（反思建议）：同模型本轮 ≥3 次失败 = DSH 重试爆发 ──
+    # 一次用户疼痛事件；额外 +1 退避计数加速熔断，避免散布失败同权重。
+    burst_models = [m for m, n in window_fails.items() if n >= 3]
+    for m in burst_models:
+        fails[m] = int(fails.get(m) or 0) + 1
 
     # keep the success map bounded: most recent first
     success = dict(sorted(success.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:SUCCESS_KEEP])
