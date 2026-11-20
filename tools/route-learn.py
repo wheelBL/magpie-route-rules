@@ -176,8 +176,8 @@ def rule_classify(row, clamp_skip_providers):
     # 输入长度超限 ≠ 输出钳制（另一机器误触发实证：错误说 input 超过模型上限
     # 344064，被当成 clampOutput——钳 max_tokens 治不了输入超长）。输入超限
     # 归 payload 学习（payloadCaps）与用户自行缩减，学习侧只 ignore。
-    if re.search(r"(input|prompt|context)[^.\n]{0,40}(length|tokens?)[^.\n]{0,40}(exceed|limit|maximum|long|large)", err) \
-            or "prompt is too long" in err or "context length" in err:
+    # 模式容忍上游拼写误差（实测 "excced"）与 max/maximum 变体。
+    if re.search(r"input too long|exc[ce]ed max input|max input length|prompt is too long|context length|input length.{0,60}\d{4,}", err):
         return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
     # Rate limiting / upstream down: pause the model for a while. The exact
     # duration comes from the exponential backoff (the caller decides).
@@ -1291,9 +1291,20 @@ def main():
             # 重试风暴感知（反思建议）：DSH 端一次失败会连发 5 次重试——
             # 同模型同窗口 ≥3 次失败 = 一次用户疼痛事件，应比散布失败更重。
             window_fails[model_key] = int(window_fails.get(model_key) or 0) + 1
-            # payload 上限学习：413 的 in tokens = 拒收证据上界
-            if status == 413:
-                in_tok = row.get("in")
+            # payload 上限学习：HTTP 413 或错误文本里的输入超长（另一机器实证：
+            # inferSrv 错误把 413 藏在 error_code 文本里，HTTP 状态不是 413）。
+            err_l = str(row.get("err") or "").lower()
+            input_too_long = status == 413 or re.search(
+                r"input too long|exc[ce]ed max input|max input length|input length.{0,40}\d{5,}", err_l)
+            if input_too_long:
+                # 优先从错误文本解析实际上超限的输入量（"current input length is N"），
+                # 退回 usage 行的 in 字段
+                in_tok = None
+                mtok = re.search(r"current input length is (\d+)", err_l) or re.search(r"input length.{0,30}?(\d{5,})", err_l)
+                if mtok:
+                    in_tok = int(mtok.group(1))
+                if not (isinstance(in_tok, (int, float)) and in_tok > 0):
+                    in_tok = row.get("in")
                 if isinstance(in_tok, (int, float)) and in_tok > 0:
                     pc = payload_caps.setdefault(model_key, {})
                     mf = pc.get("minFailTok")
@@ -1537,6 +1548,32 @@ def main():
 
     state["success"] = success
     state["fails"] = fails
+    # ── 死模型修剪（用户要求：无法使用的模型不再出现在页面/分析中）──
+    # 修剪条件（保守）：既不是任何规则的候选，也（已不在 /v1/models 或 lastAt 超 7 天）。
+    # 规则候选永远保留（无流量也仍是路由对象）；目录里还提供的也保留。
+    try:
+        available_ids = set(fetch_available_models(key) or []) if key else None
+    except Exception:
+        available_ids = None
+    rule_cand_ids = set()
+    for r in options.get("rules") or []:
+        for m in [r.get("target")] + list(r.get("fallbacks") or []):
+            if m:
+                rule_cand_ids.add(m)
+    for m in list(perf.keys()):
+        if m in rule_cand_ids:
+            continue
+        p = perf[m]
+        if (p.get("samples") or 0) == 0 and not p.get("lastAt"):
+            del perf[m]
+            continue
+        in_catalog = available_ids is None or m in available_ids
+        age_ms = now_ms - (p.get("lastAt") or 0)
+        if not in_catalog or age_ms > 7 * 24 * 3600 * 1000:
+            del perf[m]
+            log("修剪不可用模型的画像：%s（不在目录=%s，%.0f 天无流量）"
+                % (m, "是" if not in_catalog else "否", age_ms / 86400000), args.quiet)
+
     perf_bounded = dict(sorted(perf.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:30])
     state["perf"] = perf_bounded
     state["diag"] = dict(scan_diag)
