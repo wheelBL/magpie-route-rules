@@ -693,6 +693,79 @@ def compute_impact(usage_path, now_ms, window_days=7):
     total = ok + fail
     if not total:
         return None
+
+    # ── 装插件前后对比（用户要求看到"相对没有使用前的效果"）──
+    # 边界 = 全历史中首次出现切换（model≠served 且 200）的行时间——之前 = 无插件期。
+    # 两遍扫：先找边界，再分era累计（错误率 + 空回复率）。
+    before_after = None
+    try:
+        first_switch_ms = None
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("status") != 200:
+                continue
+            model = str(row.get("model") or "")
+            served = str(row.get("served") or "")
+            if model and served and not same_model(model, served):
+                try:
+                    ts_ms = int(datetime.datetime.fromisoformat(str(row.get("t"))).timestamp() * 1000)
+                    if first_switch_ms is None or ts_ms < first_switch_ms:
+                        first_switch_ms = ts_ms
+                except Exception:
+                    continue
+        if first_switch_ms is not None:
+            eras = {"pre": {"ok": 0, "fail": 0, "empty": 0}, "post": {"ok": 0, "fail": 0, "empty": 0}}
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                agent = str(row.get("agent") or "")
+                if "route-learn" in agent or agent == "Python-urllib":
+                    continue
+                status = row.get("status")
+                if isinstance(status, str) and status.isdigit():
+                    status = int(status)
+                try:
+                    ts_ms = int(datetime.datetime.fromisoformat(str(row.get("t"))).timestamp() * 1000)
+                except Exception:
+                    continue
+                era = "pre" if ts_ms < first_switch_ms else "post"
+                if status == 200:
+                    eras[era]["ok"] += 1
+                    out_v = row.get("out")
+                    if isinstance(out_v, (int, float)) and out_v == 0:
+                        eras[era]["empty"] += 1
+                elif isinstance(status, int) and status >= 400:
+                    eras[era]["fail"] += 1
+            def era_stats(e):
+                t = e["ok"] + e["fail"]
+                if not t:
+                    return None
+                return {
+                    "requests": t,
+                    "errorRatePct": round(100.0 * e["fail"] / t, 1),
+                    "emptyRatePct": round(100.0 * e["empty"] / t, 1),
+                }
+            pre_s, post_s = era_stats(eras["pre"]), era_stats(eras["post"])
+            if pre_s and post_s:
+                before_after = {
+                    "boundary": time.strftime("%m-%d %H:%M", time.localtime(first_switch_ms / 1000)),
+                    "pre": pre_s,
+                    "post": post_s,
+                }
+    except Exception:
+        before_after = None
+
     return {
         "windowDays": window_days,
         "requests": total,
@@ -702,6 +775,7 @@ def compute_impact(usage_path, now_ms, window_days=7):
         "switchGuaranteedPct": round(100.0 * saves / total, 1),
         "medianTtftS": med(ttfts),
         "medianDurationS": med(durations),
+        "beforeAfter": before_after,
     }
 
 

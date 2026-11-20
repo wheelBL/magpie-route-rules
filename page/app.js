@@ -61,6 +61,45 @@ function render(o) {
       }
       impBox.appendChild(card)
     }
+
+    // 前后对比（装插件边界 = 首次透明切换，自动检测）
+    const ba = im.beforeAfter
+    if (ba) {
+      const box = document.createElement('div')
+      box.style.margin = '14px 0 0'
+      box.style.padding = '10px 14px'
+      box.style.border = '1px solid var(--border)'
+      box.style.borderRadius = '8px'
+      const head = document.createElement('div')
+      head.style.fontSize = '12px'
+      head.style.marginBottom = '6px'
+      head.textContent = '装插件前后（边界 ' + esc(ba.boundary) + '，按首次透明切换自动划分）'
+      box.appendChild(head)
+      const rows2 = [
+        ['错误率', ba.pre.errorRatePct + '%', ba.post.errorRatePct + '%'],
+        ['空回复率（200 但输出 0）', ba.pre.emptyRatePct + '%', ba.post.emptyRatePct + '%'],
+      ]
+      for (const [label, pre, post] of rows2) {
+        const r = document.createElement('div')
+        r.style.display = 'flex'
+        r.style.justifyContent = 'space-between'
+        r.style.fontSize = '12px'
+        r.style.padding = '2px 0'
+        const a = document.createElement('span')
+        a.textContent = label
+        const b = document.createElement('span')
+        b.textContent = pre + '  →  ' + post + '（装后）'
+        r.append(a, b)
+        box.appendChild(r)
+      }
+      const cap = document.createElement('div')
+      cap.className = 'muted'
+      cap.style.fontSize = '11px'
+      cap.style.marginTop = '4px'
+      cap.textContent = '装前 ' + ba.pre.requests + ' 请求 · 装后 ' + ba.post.requests + ' 请求'
+      box.appendChild(cap)
+      impBox.appendChild(box)
+    }
   }
 
   // ── 模型优先级 ──
