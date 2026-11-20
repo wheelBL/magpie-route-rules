@@ -157,14 +157,41 @@ function learnedClampCap(modelId, actions) {
 }
 
 // Prefer learned-capable, then unknown (probe it), then incapable (last resort).
-function pickImageTarget(candidates, learnedImages, now, ttl) {
-  const scored = candidates.map((m) => ({ m, h: imageHealth(m, learnedImages, now, ttl) }))
+function pickImageTarget(candidates, learnedImages, now, ttl, payloadCaps, estTok) {
+  // Payload 前置过滤（学习式）：已知拒收此输入量的候选先剔除；
+  // 全部被剔除时回退原列表（fail-open，让上游自己说话）。
+  let pool = candidates
+  if (payloadCaps && estTok > 0) {
+    const pass = candidates.filter((m) => {
+      const pc = payloadCaps[m]
+      return !(pc && Number.isFinite(pc.minFailTok) && estTok >= pc.minFailTok)
+    })
+    if (pass.length) pool = pass
+  }
+  const scored = pool.map((m) => ({ m, h: imageHealth(m, learnedImages, now, ttl) }))
   for (const tier of ['capable', 'unknown', 'incapable']) {
     for (const s of scored) {
       if (s.h === tier) return s.m
     }
   }
   return null
+}
+
+// Rough input-token estimate (chars/2, images ≈ 1k) — only used to compare
+// against learned 413 caps; a wrong estimate just falls through fail-open.
+function estimateInputTokens(body) {
+  let chars = 0
+  for (const msg of (body.messages || [])) {
+    const c = msg && msg.content
+    if (typeof c === 'string') chars += c.length
+    else if (Array.isArray(c)) {
+      for (const part of c) {
+        if (part && typeof part.text === 'string') chars += part.text.length
+        else if (part && (part.image_url || part.image || part.input_image)) chars += 2000
+      }
+    }
+  }
+  return Math.ceil(chars / 2)
 }
 
 function clampTokens(body, keys, cap) {
@@ -224,7 +251,8 @@ export function onRequest(body, ctx) {
         const ttl = Number.isFinite(options.learningTtlMs) && options.learningTtlMs > 0
           ? options.learningTtlMs : 21600000
         const learnedImages = options.learned && options.learned.images ? options.learned.images : {}
-        target = pickImageTarget(candidates, learnedImages, now, ttl)
+        const payloadCaps = (options.learned && options.learned.payloadCaps) || null
+        target = pickImageTarget(candidates, learnedImages, now, ttl, payloadCaps, estimateInputTokens(body))
       } else if (candidates.length) {
         target = candidates[0]
       }

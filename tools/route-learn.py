@@ -1185,6 +1185,9 @@ def main():
 
     learned = options.get("learned") if isinstance(options.get("learned"), dict) else {}
     images = dict(learned.get("images") if isinstance(learned.get("images"), dict) else {})
+    # payload 上限学习（route-rules 侧"前置限流"）：413 行的输入 tokens 是该模型
+    # 上限的上界证据；200 行的大输入是下界证据。中间件按估算输入量过滤候选。
+    payload_caps = dict(learned.get("payloadCaps") if isinstance(learned.get("payloadCaps"), dict) else {})
     actions = list(learned.get("actions") if isinstance(learned.get("actions"), list) else [])
     # ignore-kind records are dedup bookkeeping, not enforcement: keep them in
     # the learner's own state, out of the middleware-visible options.
@@ -1274,6 +1277,21 @@ def main():
             # 重试风暴感知（反思建议）：DSH 端一次失败会连发 5 次重试——
             # 同模型同窗口 ≥3 次失败 = 一次用户疼痛事件，应比散布失败更重。
             window_fails[model_key] = int(window_fails.get(model_key) or 0) + 1
+            # payload 上限学习：413 的 in tokens = 拒收证据上界
+            if status == 413:
+                in_tok = row.get("in")
+                if isinstance(in_tok, (int, float)) and in_tok > 0:
+                    pc = payload_caps.setdefault(model_key, {})
+                    mf = pc.get("minFailTok")
+                    pc["minFailTok"] = int(in_tok) if mf is None else min(mf, int(in_tok))
+                    pc["at"] = now_ms
+
+        # 200 行的大输入 = 承载证据下界（与 413 上界夹逼真实上限）
+        in_tok_ok = row.get("in")
+        if status == 200 and isinstance(in_tok_ok, (int, float)) and in_tok_ok > 1000:
+            pc2 = payload_caps.setdefault(model_key, {})
+            pc2["maxOkTok"] = max(pc2.get("maxOkTok") or 0, int(in_tok_ok))
+            pc2["at"] = now_ms
 
         # A 200 from real traffic is the strongest recovery signal: clear any
         # fresh pause right away and reset the backoff counter (minimal
@@ -1575,10 +1593,11 @@ def main():
     view_changed = learned_view != options.get("learnedView")
     changed = actions != (learned.get("actions") if isinstance(learned.get("actions"), list) else []) \
         or images != (learned.get("images") if isinstance(learned.get("images"), dict) else {}) \
+        or payload_caps != (learned.get("payloadCaps") if isinstance(learned.get("payloadCaps"), dict) else {}) \
         or view_changed
     if changed:
         backup(args.plugins)
-        options["learned"] = {"images": images, "actions": actions}
+        options["learned"] = {"images": images, "actions": actions, "payloadCaps": payload_caps}
         options["learnedView"] = learned_view
         entry["options"] = options
         atomic_write_json(args.plugins, plugins)
