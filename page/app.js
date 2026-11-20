@@ -62,17 +62,25 @@ function render(o) {
       }
       impBox.appendChild(card)
     }
-    // 一行小字承载被替换的上下文（请求量/时延/依据），不再占卡位
-    const ctx = []
-    if (im.requests != null) ctx.push(im.requests + ' 请求（' + im.windowDays + 'd）')
-    if (im.medianTtftS != null) ctx.push('首字节中位 ' + im.medianTtftS + 's')
-    if (im.medianDurationS != null) ctx.push('总耗时 ' + im.medianDurationS + 's')
-    if (ba && ba.boundary) ctx.push('边界 ' + esc(ba.boundary) + ' 自动检测')
-    if (enp) ctx.push('若移除依据：切换请求预算超限→掐流（87db83cd 实证）')
-    if (ctx.length) {
-      const m = el('div', 'delta kpi-ctx')
-      m.textContent = ctx.join(' · ')
-      impBox.appendChild(m)
+    // 上下文微统计条（与 KPI 卡同构：数值 + 标签），依据成注脚
+    const cells = []
+    if (im.requests != null) cells.push([String(im.requests), '请求 · ' + im.windowDays + ' 天'])
+    if (im.medianTtftS != null) cells.push([im.medianTtftS + 's', '首字节中位'])
+    if (im.medianDurationS != null) cells.push([im.medianDurationS + 's', '总耗时中位'])
+    if (ba && ba.boundary) cells.push([String(ba.boundary), '边界 · 自动检测'])
+    if (cells.length) {
+      const strip = el('div', 'stat-strip')
+      for (const [v, k] of cells) {
+        const c = el('div', 'stat-cell')
+        c.appendChild(el('b', null, v))
+        c.appendChild(el('span', null, k))
+        strip.appendChild(c)
+      }
+      impBox.appendChild(strip)
+    }
+    if (enp) {
+      impBox.appendChild(el('div', 'stat-note',
+        '若移除依据：切换请求预算超模型上限 → 推理烧尽 → 掐流（87db83cd 实证：重试 5 次全败）'))
     }
   }
 
