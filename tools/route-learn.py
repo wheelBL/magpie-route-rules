@@ -680,7 +680,8 @@ def compute_impact(usage_path, now_ms, window_days=7):
                 if isinstance(ttft, (int, float)) and ttft > 0:
                     ttfts.append(ttft)
             elif isinstance(status, int) and status >= 400:
-                fail += 1
+                if status != 499:  # 客户端取消 ≠ 服务失败（可用度同口径）
+                    fail += 1
     except Exception:
         return None
 
@@ -742,11 +743,20 @@ def compute_impact(usage_path, now_ms, window_days=7):
                 era = "pre" if ts_ms < first_switch_ms else "post"
                 if status == 200:
                     eras[era]["ok"] += 1
+                    # 空回复口径（7d 实测拆解修正）：只算真实用户请求——
+                    # 剔 agent=magpie 内部调用（classify 等 out=0 正常）、
+                    # 剔 in=0 行（超长操作未记录输入，跨时代不可比）。
                     out_v = row.get("out")
-                    if isinstance(out_v, (int, float)) and out_v == 0:
+                    in_v = row.get("in")
+                    if (isinstance(out_v, (int, float)) and out_v == 0
+                            and agent != "magpie"
+                            and isinstance(in_v, (int, float)) and in_v > 0):
                         eras[era]["empty"] += 1
                 elif isinstance(status, int) and status >= 400:
-                    eras[era]["fail"] += 1
+                    # 499 = 客户端主动取消（实测 7d 的 0.1% 错误率 15/16 是它），
+                    # 不是服务失败——剔出错误率。
+                    if status != 499:
+                        eras[era]["fail"] += 1
             def era_stats(e):
                 t = e["ok"] + e["fail"]
                 if not t:
