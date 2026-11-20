@@ -114,13 +114,22 @@
 
   .empty { color: var(--faint); font-size: 12px; padding: 8px 0 }
 
-  /* ── 对比条（装前历史 / 无插件预估）── */
-  .cmp { margin-top: 12px; display: flex; flex-direction: column; gap: 2px }
-  .cmp-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: var(--muted); margin: 6px 0 2px; text-transform: uppercase }
-  .cmp-row { display: flex; justify-content: space-between; align-items: baseline; padding: 3px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); font-size: 12.5px }
-  .cmp-k { color: var(--muted) }
-  .cmp-v { font-variant-numeric: tabular-nums }
-  .cmp-cap { font-size: 11px; color: var(--faint); padding: 1px 12px }
+  /* ── 对比表（Refactoring UI：少边框·对齐列·留白）── */
+  .cmp-card { margin-top: 16px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 6px 18px 12px }
+  .cmp-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums }
+  .cmp-table th {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
+    font-weight: 600; text-align: right; padding: 10px 8px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .cmp-table th:first-child { text-align: left }
+  .cmp-table td { padding: 8px; text-align: right; font-size: 13.5px; border-bottom: 1px solid color-mix(in srgb, var(--fg) 4%, transparent) }
+  .cmp-table tr:last-child td { border-bottom: none }
+  .cmp-table td:first-child { text-align: left; color: var(--muted); font-size: 12px }
+  .cmp-table td.hi { color: var(--ok); font-weight: 600 }
+  .cmp-table td.lo { color: var(--warn); font-weight: 600 }
+  .cmp-table td.dim { color: var(--faint) }
+  .cmp-note { font-size: 11px; color: var(--faint); margin-top: 8px; line-height: 1.5 }
 </style>
 </head>
 <body>

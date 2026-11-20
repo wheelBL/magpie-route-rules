@@ -66,28 +66,47 @@ function render(o) {
       impBox.appendChild(card)
     }
 
-    // 对比区：装前历史（真实）+ 无插件预估，统一为一行式对比条
-    const cmp = el('div', 'cmp')
+    // 对比表（Stripe 模式：对齐列 · 一个容器 · 少边框）
     const ba = im.beforeAfter
-    if (ba) {
-      cmp.appendChild(el('div', 'cmp-title', '装插件前后（真实历史 · 边界 ' + ba.boundary + ' 自动检测）'))
-      const r1 = el('div', 'cmp-row')
-      r1.append(el('span', 'cmp-k', '错误率'), el('span', 'cmp-v', ba.pre.errorRatePct + '% → ' + ba.post.errorRatePct + '%'))
-      cmp.appendChild(r1)
-      const r2 = el('div', 'cmp-row')
-      r2.append(el('span', 'cmp-k', '空回复率'), el('span', 'cmp-v', ba.pre.emptyRatePct + '% → ' + ba.post.emptyRatePct + '%'))
-      cmp.appendChild(r2)
-      const rc = el('div', 'cmp-cap', '装前 ' + ba.pre.requests + ' · 装后 ' + ba.post.requests + ' 请求')
-      cmp.appendChild(rc)
+    if (ba || enp) {
+      const card = el('div', 'cmp-card')
+      const tbl = el('table', 'cmp-table')
+      const thead = el('thead')
+      const hr = el('tr')
+      hr.appendChild(el('th', null, ''))
+      hr.appendChild(el('th', null, '装前 · 历史'))
+      hr.appendChild(el('th', null, '装后 · 现在'))
+      hr.appendChild(el('th', null, enp ? '若移除 · 预估' : ''))
+      thead.appendChild(hr)
+      tbl.appendChild(thead)
+      const tbody = el('tbody')
+      const row = (k, pre, post, est, postCls, estCls) => {
+        const tr = el('tr')
+        tr.appendChild(el('td', null, k))
+        const t1 = el('td', pre == null ? 'dim' : null, pre == null ? '—' : pre)
+        const t2 = el('td', postCls || null, post == null ? '—' : post)
+        const t3 = el('td', estCls || (est == null ? 'dim' : null), est == null ? '—' : est)
+        tr.append(t1, t2, t3)
+        return tr
+      }
+      tbody.appendChild(row('可用度', null, im.availability != null ? im.availability + '%' : '—',
+        enp ? enp.availabilityPct + '%' : null, 'hi', enp ? 'lo' : null))
+      if (ba) {
+        tbody.appendChild(row('错误率', ba.pre.errorRatePct + '%', ba.post.errorRatePct + '%', null))
+        tbody.appendChild(row('空回复率', ba.pre.emptyRatePct + '%', ba.post.emptyRatePct + '%', null))
+      }
+      tbl.appendChild(tbody)
+      card.appendChild(tbl)
+      if (ba) {
+        card.appendChild(el('div', 'cmp-note',
+          '装前 ' + ba.pre.requests + ' · 装后 ' + ba.post.requests + ' 请求 · 边界自动检测（首次透明切换 ' + esc(ba.boundary) + '）'))
+      }
+      if (enp) {
+        card.appendChild(el('div', 'cmp-note',
+          '若移除依据：' + enp.wouldFail + ' 个切换请求预算超模型上限 → 推理烧尽 → 掐流（87db83cd 实证，重试 5 次全败）；装前健康是 4000 预算时代且 glm 优先路由，条件不同'))
+      }
+      impBox.appendChild(card)
     }
-    if (enp) {
-      cmp.appendChild(el('div', 'cmp-title', '若现在移除插件（预估 · 当前预算与路由不变）'))
-      const r3 = el('div', 'cmp-row')
-      r3.append(el('span', 'cmp-k', '可用度'), el('span', 'cmp-v', enp.availabilityPct + '%（' + enp.wouldFail + ' 个切换请求预计掐流/超限失败）'))
-      cmp.appendChild(r3)
-      cmp.appendChild(el('div', 'cmp-cap', '依据：预算超上限→推理烧尽→掐流（87db83cd 实证）；装前健康是 4000 预算时代，条件不同'))
-    }
-    if (cmp.childNodes.length) impBox.appendChild(cmp)
   }
 
   // ── 模型优先级 ──
