@@ -28,6 +28,11 @@ function render(o) {
   } else {
     const enp = im.estimatedNoPlugin
     const ba = im.beforeAfter
+    // 副标题承载分母性质信息（请求量/边界）；效果区只留有优势故事的卡
+    const subParts = [im.windowDays + ' 天滚动 · 排除伴生流量']
+    if (im.requests != null) subParts.push(im.requests + ' 请求')
+    if (ba && ba.boundary) subParts.push('装插件边界 ' + ba.boundary + '（自动检测）')
+    document.getElementById('impactSub').textContent = subParts.join(' · ')
     // 每张卡自带前后故事（delta 行）；卡网格即全部——无外挂对比组件
     const cards = [
       { cls: 'good', label: '可用度', value: im.availability != null ? im.availability : '—', unit: '%',
@@ -62,22 +67,7 @@ function render(o) {
       }
       impBox.appendChild(card)
     }
-    // 上下文微统计条（与 KPI 卡同构：数值 + 标签），依据成注脚
-    const cells = []
-    if (im.requests != null) cells.push([String(im.requests), '请求 · ' + im.windowDays + ' 天'])
-    if (im.medianTtftS != null) cells.push([im.medianTtftS + 's', '首字节中位'])
-    if (im.medianDurationS != null) cells.push([im.medianDurationS + 's', '总耗时中位'])
-    if (ba && ba.boundary) cells.push([String(ba.boundary), '边界自动检测'])
-    if (cells.length) {
-      const strip = el('div', 'stat-strip')
-      for (const [v, k] of cells) {
-        const c = el('div', 'stat-cell')
-        c.appendChild(el('b', null, v))
-        c.appendChild(el('span', null, k))
-        strip.appendChild(c)
-      }
-      impBox.appendChild(strip)
-    }
+    // 依据注脚（优势的因果说明）；请求量/边界已在副标题，时延中位归模型表
     if (enp) {
       impBox.appendChild(el('div', 'stat-note',
         '若移除依据：切换请求预算超模型上限 → 推理烧尽 → 掐流（87db83cd 实证：重试 5 次全败）'))
