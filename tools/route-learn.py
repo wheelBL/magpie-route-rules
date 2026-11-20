@@ -200,13 +200,21 @@ def fetch_available_models(key):
         return None
 
 
+def _ttfb_penalty(pstats):
+    """首字节时延惩罚因子：10s TTFB 减半分数（体感 = 吞吐 × 响应及时性）。"""
+    ttfb = pstats.get("ewmaTtfbMs")
+    if not isinstance(ttfb, (int, float)) or ttfb <= 0:
+        return 1.0
+    return 1.0 / (1.0 + (ttfb / 1000.0) / 10.0)
+
+
 def perf_score(pstats):
-    """体验综合分：稳定性（连败惩罚）× 速度（吞吐率 EWMA）。样本不足返回 None。"""
+    """体验综合分：吞吐率 ÷ (1+连败) × 首字节惩罚。样本不足返回 None。"""
     if not pstats or (pstats.get("samples") or 0) < 2:
         return None
     cf = pstats.get("consecFails") or 0
     tps = pstats.get("ewmaTps") or 0
-    return round(tps / (1 + cf), 1)
+    return round(tps / (1 + cf) * _ttfb_penalty(pstats), 1)
 
 
 def time_bucket(now=None):
@@ -221,11 +229,25 @@ def bucket_key(now_ms=None):
     return "%d_%d" % (wk, hb)
 
 
+BUCKET_NAMES = ["凌晨(0-6)", "上午(6-12)", "下午(12-18)", "晚间(18-24)"]
+
+
+def bucket_label(bkey):
+    """'0_3' → '工作日·晚间(18-24)'——反思/展示用可读桶名。"""
+    try:
+        wk, hb = str(bkey).split("_")
+        return ("周末" if wk == "1" else "工作日") + "·" + BUCKET_NAMES[int(hb)]
+    except Exception:
+        return str(bkey)
+
+
 def perf_score_bucket(pstats, bkey):
     """时段桶内评分：样本 ≥3 且有吞吐率数据时优先于全局分（更贴近当下）。"""
     b = (pstats.get("buckets") or {}).get(bkey)
     if b and (b.get("samples") or 0) >= 3 and b.get("ewmaTps"):
-        return round(b["ewmaTps"] / (1 + (b.get("consecFails") or 0)), 1)
+        ttfb = b.get("ewmaTtfbMs")
+        pen = 1.0 / (1.0 + (ttfb / 1000.0) / 10.0) if isinstance(ttfb, (int, float)) and ttfb > 0 else 1.0
+        return round(b["ewmaTps"] / (1 + (b.get("consecFails") or 0)) * pen, 1)
     return None
 
 
@@ -670,6 +692,7 @@ def compute_impact(usage_path, now_ms, window_days=7):
 
 def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
     """人读视图：伴生写进 options.learnedView，magpie 插件页渲染。"""
+    cur_bkey = bucket_key(now_ms)
     perf_summary = []
     for m, p in perf.items():
         s = perf_score_now(p, now_ms)
@@ -677,12 +700,23 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
         e0 = {"model": m, "score": s, "tps": p.get("ewmaTps"),
               "ttfS": round(ttf_ms0 / 1000, 1) if isinstance(ttf_ms0, (int, float)) else None,
               "samples": p.get("samples"), "consecFails": p.get("consecFails")}
+        # 时段桶可见性（AI 反思建议：桶键不自解释是断言障碍）
+        bs = perf_score_bucket(p, cur_bkey)
+        bkt = (p.get("buckets") or {}).get(cur_bkey)
+        if bs is not None:
+            e0["bucketScore"] = bs
+        if bkt and (bkt.get("samples") or 0) > 0:
+            e0["bucketSamples"] = bkt.get("samples")
+        ft = p.get("fastTps")
+        if isinstance(ft, (int, float)):
+            e0["fastTps"] = ft
         if p.get("capabilityDegraded"):
             e0["degraded"] = p["capabilityDegraded"]
         perf_summary.append(e0)
     perf_summary.sort(key=lambda e: -(e["score"] if e["score"] is not None else -1))
     view = {
         "generatedAt": time.strftime("%Y-%m-%d %H:%M"),
+        "bucket": {"key": cur_bkey, "label": bucket_label(cur_bkey)},
         "perfSummary": perf_summary[:8],
         "insights": insights[:10],
         "imagesView": {m: {"state": v.get("state"), "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
@@ -733,6 +767,22 @@ def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, i
             insights.append({"level": "warn",
                              "text": "%s 连败 %d 次（吞吐率 %s tok/s）——若非流量特性变化，建议人工检查该模型"
                                      % (m, cf, p.get("ewmaTps"))})
+    # 2b. 趋势恶化（AI 反思建议）：近期快窗 TPS 显著低于长期 EWMA 且不是连败——
+    #     渐进变慢/间歇劣化是 consecFails 的盲区，快慢双 EWMA 对比才能看见。
+    for m, p in perf.items():
+        ft, et = p.get("fastTps"), p.get("ewmaTps")
+        if isinstance(ft, (int, float)) and isinstance(et, (int, float)) and et >= 5 \
+                and (p.get("samples") or 0) >= 5 and ft < et * 0.6:
+            insights.append({"level": "warn",
+                             "text": "%s 趋势恶化：近期吞吐 %.1f 显著低于历史 %.1f tok/s（非连败型劣化）"
+                                     % (m, ft, et)})
+    # 2c. 样本陈旧（AI 反思建议）：lastAt 超过 24h 无更新——流量消失或采集停滞
+    for m, p in perf.items():
+        age_h = (now_ms - (p.get("lastAt") or 0)) / 3600000.0
+        if (p.get("samples") or 0) > 0 and age_h > 24:
+            insights.append({"level": "info",
+                             "text": "%s 性能样本已 %.0f 小时未更新（无流量或采集停滞，评分可能不反映现状）"
+                                     % (m, age_h)})
     # 3. 从未被试探的候选：能力未知（可能是从未有过带图/该类流量的模型）
     unsampled = [m for m, p in perf.items() if int(p.get("samples") or 0) == 0]
     if unsampled:
@@ -1187,6 +1237,9 @@ def main():
                 tps = out_n / ms_n * 1000
                 prev = pstats.get("ewmaTps")
                 pstats["ewmaTps"] = round(tps, 1) if prev is None else round(prev * 0.7 + tps * 0.3, 1)
+                # 快窗 EWMA（0.3/0.7 ≈ 最近 3 个样本）——与慢窗对比做趋势恶化检测
+                prevf = pstats.get("fastTps")
+                pstats["fastTps"] = round(tps, 1) if prevf is None else round(prevf * 0.3 + tps * 0.7, 1)
                 prevb = pb.get("ewmaTps")
                 pb["ewmaTps"] = round(tps, 1) if prevb is None else round(prevb * 0.7 + tps * 0.3, 1)
             if isinstance(ttft, (int, float)) and ttft > 0:
