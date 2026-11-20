@@ -67,7 +67,7 @@ function render(o) {
     if (im.requests != null) cells.push([String(im.requests), '请求 · ' + im.windowDays + ' 天'])
     if (im.medianTtftS != null) cells.push([im.medianTtftS + 's', '首字节中位'])
     if (im.medianDurationS != null) cells.push([im.medianDurationS + 's', '总耗时中位'])
-    if (ba && ba.boundary) cells.push([String(ba.boundary), '边界 · 自动检测'])
+    if (ba && ba.boundary) cells.push([String(ba.boundary), '边界自动检测'])
     if (cells.length) {
       const strip = el('div', 'stat-strip')
       for (const [v, k] of cells) {
