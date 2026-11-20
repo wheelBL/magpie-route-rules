@@ -27,15 +27,19 @@ function render(o) {
     impBox.appendChild(el('p', 'empty', '统计中（伴生每小时重算，首轮运行后显示）'))
   } else {
     document.getElementById('impactSub').textContent = im.windowDays + ' 天滚动 · 排除伴生流量'
+    const enp = im.estimatedNoPlugin
+    const availDelta = enp && enp.availabilityPct != null && im.availability != null
+      ? ['无插件预估 ' + enp.availabilityPct + '% ', Math.max(0, Math.round((im.availability - enp.availabilityPct) * 10) / 10)]
+      : ['7 天 HTTP 成功率', null]
     const cards = [
       { cls: 'good', label: '可用度', value: im.availability != null ? im.availability : '—', unit: '%',
-        delta: ['7 天 HTTP 成功率', null, null] },
+        delta: availDelta },
       { cls: 'warn', label: '切换保障', value: im.saves != null ? im.saves : '—', unit: ' 次',
-        delta: ['占请求 ' + (im.switchGuaranteedPct != null ? im.switchGuaranteedPct + '%' : '—') + ' · 预算/流透明切换保障完整交付', null, null] },
+        delta: ['占 ' + (im.switchGuaranteedPct != null ? im.switchGuaranteedPct + '%' : '—') + ' · 预算/流切换保障完整交付', null] },
       { cls: '', label: '请求总数', value: im.requests != null ? im.requests : '—', unit: ' (' + im.windowDays + 'd)',
-        delta: ['失败 ' + Math.max(0, Math.round((im.requests || 0) * (1 - (im.availability || 100) / 100))) + ' 次', null, null] },
+        delta: ['失败 ' + Math.max(0, Math.round((im.requests || 0) * (1 - (im.availability || 100) / 100))) + ' 次', null] },
       { cls: '', label: '首字节中位', value: im.medianTtftS != null ? im.medianTtftS : '—', unit: 's',
-        delta: ['总耗时中位 ' + (im.medianDurationS != null ? im.medianDurationS + 's' : '—'), null, null] },
+        delta: ['总耗时中位 ' + (im.medianDurationS != null ? im.medianDurationS + 's' : '—'), null] },
     ]
     for (const c of cards) {
       const card = el('div', 'kpi ' + (c.cls || ''))
@@ -50,9 +54,9 @@ function render(o) {
       card.appendChild(v)
       if (c.delta) {
         const d = el('div', 'delta')
-        if (c.delta[2] != null && c.delta[2] > 0) {
+        if (c.delta[1] != null && c.delta[1] > 0) {
           d.append(c.delta[0] + ' ')
-          const b = el('b', null, '+' + (Math.round(c.delta[2] * 10) / 10) + '%')
+          const b = el('b', null, '+' + c.delta[1])
           d.appendChild(b)
         } else {
           d.textContent = c.delta[0]
@@ -62,73 +66,28 @@ function render(o) {
       impBox.appendChild(card)
     }
 
-    // 前后对比（装插件边界 = 首次透明切换，自动检测）
+    // 对比区：装前历史（真实）+ 无插件预估，统一为一行式对比条
+    const cmp = el('div', 'cmp')
     const ba = im.beforeAfter
     if (ba) {
-      const box = document.createElement('div')
-      box.style.margin = '14px 0 0'
-      box.style.padding = '10px 14px'
-      box.style.border = '1px solid var(--border)'
-      box.style.borderRadius = '8px'
-      const head = document.createElement('div')
-      head.style.fontSize = '12px'
-      head.style.marginBottom = '6px'
-      head.textContent = '装插件前后（边界 ' + esc(ba.boundary) + '，按首次透明切换自动划分）'
-      box.appendChild(head)
-      const rows2 = [
-        ['错误率', ba.pre.errorRatePct + '%', ba.post.errorRatePct + '%'],
-        ['空回复率（200 但输出 0）', ba.pre.emptyRatePct + '%', ba.post.emptyRatePct + '%'],
-      ]
-      for (const [label, pre, post] of rows2) {
-        const r = document.createElement('div')
-        r.style.display = 'flex'
-        r.style.justifyContent = 'space-between'
-        r.style.fontSize = '12px'
-        r.style.padding = '2px 0'
-        const a = document.createElement('span')
-        a.textContent = label
-        const b = document.createElement('span')
-        b.textContent = pre + '  →  ' + post + '（装后）'
-        r.append(a, b)
-        box.appendChild(r)
-      }
-      const cap = document.createElement('div')
-      cap.className = 'muted'
-      cap.style.fontSize = '11px'
-      cap.style.marginTop = '4px'
-      cap.textContent = '装前 ' + ba.pre.requests + ' 请求 · 装后 ' + ba.post.requests + ' 请求'
-      box.appendChild(cap)
-      impBox.appendChild(box)
+      cmp.appendChild(el('div', 'cmp-title', '装插件前后（真实历史 · 边界 ' + ba.boundary + ' 自动检测）'))
+      const r1 = el('div', 'cmp-row')
+      r1.append(el('span', 'cmp-k', '错误率'), el('span', 'cmp-v', ba.pre.errorRatePct + '% → ' + ba.post.errorRatePct + '%'))
+      cmp.appendChild(r1)
+      const r2 = el('div', 'cmp-row')
+      r2.append(el('span', 'cmp-k', '空回复率'), el('span', 'cmp-v', ba.pre.emptyRatePct + '% → ' + ba.post.emptyRatePct + '%'))
+      cmp.appendChild(r2)
+      const rc = el('div', 'cmp-cap', '装前 ' + ba.pre.requests + ' · 装后 ' + ba.post.requests + ' 请求')
+      cmp.appendChild(rc)
     }
-
-    // 反事实估计：若现在移除插件（当前预算与路由不变）
-    const enp = im.estimatedNoPlugin
     if (enp) {
-      const eb = document.createElement('div')
-      eb.style.margin = '10px 0 0'
-      eb.style.padding = '10px 14px'
-      eb.style.border = '1px solid var(--border-strong)'
-      eb.style.borderRadius = '8px'
-      const eh = document.createElement('div')
-      eh.style.fontSize = '12px'
-      eh.style.marginBottom = '4px'
-      eh.textContent = '若现在移除插件（当前预算与路由不变）——预估'
-      eb.appendChild(eh)
-      const el2 = document.createElement('div')
-      el2.style.fontSize = '12px'
-      const strong = document.createElement('b')
-      strong.textContent = '可用度预计 ' + enp.availabilityPct + '%'
-      el2.appendChild(strong)
-      el2.appendChild(document.createTextNode('（当前 ' + (im.availability != null ? im.availability : '—') + '%）：' + enp.wouldFail + ' 个切换保障的请求预计以掐流/超限失败'))
-      eb.appendChild(el2)
-      const ec = document.createElement('div')
-      ec.className = 'muted'
-      ec.style.fontSize = '11px'
-      ec.style.marginTop = '3px'
-      ec.textContent = '依据：预算超模型上限→推理烧尽→掐流（session-87db83cd 实证：重试 5 次全败）；与"装前历史"不同——装前是 4000 预算时代且 glm 优先路由，本就健康'
-      eb.appendChild(ec)
-      impBox.appendChild(eb)
+      cmp.appendChild(el('div', 'cmp-title', '若现在移除插件（预估 · 当前预算与路由不变）'))
+      const r3 = el('div', 'cmp-row')
+      r3.append(el('span', 'cmp-k', '可用度'), el('span', 'cmp-v', enp.availabilityPct + '%（' + enp.wouldFail + ' 个切换请求预计掐流/超限失败）'))
+      cmp.appendChild(r3)
+      cmp.appendChild(el('div', 'cmp-cap', '依据：预算超上限→推理烧尽→掐流（87db83cd 实证）；装前健康是 4000 预算时代，条件不同'))
     }
+    if (cmp.childNodes.length) impBox.appendChild(cmp)
   }
 
   // ── 模型优先级 ──

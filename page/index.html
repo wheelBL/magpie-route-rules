@@ -113,6 +113,14 @@
   }
 
   .empty { color: var(--faint); font-size: 12px; padding: 8px 0 }
+
+  /* ── 对比条（装前历史 / 无插件预估）── */
+  .cmp { margin-top: 12px; display: flex; flex-direction: column; gap: 2px }
+  .cmp-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: var(--muted); margin: 6px 0 2px; text-transform: uppercase }
+  .cmp-row { display: flex; justify-content: space-between; align-items: baseline; padding: 3px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); font-size: 12.5px }
+  .cmp-k { color: var(--muted) }
+  .cmp-v { font-variant-numeric: tabular-nums }
+  .cmp-cap { font-size: 11px; color: var(--faint); padding: 1px 12px }
 </style>
 </head>
 <body>
