@@ -26,86 +26,53 @@ function render(o) {
   if (!im) {
     impBox.appendChild(el('p', 'empty', '统计中（伴生每小时重算，首轮运行后显示）'))
   } else {
-    document.getElementById('impactSub').textContent = im.windowDays + ' 天滚动 · 排除伴生流量'
     const enp = im.estimatedNoPlugin
-    const availDelta = enp && enp.availabilityPct != null && im.availability != null
-      ? ['无插件预估 ' + enp.availabilityPct + '% ', Math.max(0, Math.round((im.availability - enp.availabilityPct) * 10) / 10)]
-      : ['7 天 HTTP 成功率', null]
+    const ba = im.beforeAfter
+    // 每张卡自带前后故事（delta 行）；卡网格即全部——无外挂对比组件
     const cards = [
       { cls: 'good', label: '可用度', value: im.availability != null ? im.availability : '—', unit: '%',
-        delta: availDelta },
+        delta: enp && enp.availabilityPct != null && im.availability != null
+          ? { text: '若移除预估 ' + enp.availabilityPct + '%', gain: Math.max(0, Math.round((im.availability - enp.availabilityPct) * 10) / 10) }
+          : { text: '7 天 HTTP 成功率' } },
       { cls: 'warn', label: '切换保障', value: im.saves != null ? im.saves : '—', unit: ' 次',
-        delta: ['占 ' + (im.switchGuaranteedPct != null ? im.switchGuaranteedPct + '%' : '—') + ' · 预算/流切换保障完整交付', null] },
-      { cls: '', label: '请求总数', value: im.requests != null ? im.requests : '—', unit: ' (' + im.windowDays + 'd)',
-        delta: ['失败 ' + Math.max(0, Math.round((im.requests || 0) * (1 - (im.availability || 100) / 100))) + ' 次', null] },
-      { cls: '', label: '首字节中位', value: im.medianTtftS != null ? im.medianTtftS : '—', unit: 's',
-        delta: ['总耗时中位 ' + (im.medianDurationS != null ? im.medianDurationS + 's' : '—'), null] },
+        delta: { text: '占 ' + (im.switchGuaranteedPct != null ? im.switchGuaranteedPct + '%' : '—') + ' · 透明切换保障交付' } },
+      { cls: ba && ba.post.errorRatePct != null ? 'good' : '', label: '错误率',
+        value: ba ? ba.post.errorRatePct : '—', unit: '%',
+        delta: ba ? { text: '装前 ' + ba.pre.errorRatePct + '%' } : { text: '—' } },
+      { cls: ba ? 'warn' : '', label: '空回复率',
+        value: ba ? ba.post.emptyRatePct : '—', unit: '%',
+        delta: ba ? { text: '装前 ' + ba.pre.emptyRatePct + '% · 口径待拆解' } : { text: '—' } },
     ]
     for (const c of cards) {
       const card = el('div', 'kpi ' + (c.cls || ''))
       card.appendChild(el('div', 'label', c.label))
       const v = el('div', 'value')
       v.textContent = String(c.value)
-      if (c.unit) {
-        const u = el('small', null, c.unit)
-        u.textContent = ' ' + c.unit
-        v.appendChild(u)
-      }
+      if (c.unit) v.appendChild(document.createTextNode(' ' + c.unit))
       card.appendChild(v)
       if (c.delta) {
         const d = el('div', 'delta')
-        if (c.delta[1] != null && c.delta[1] > 0) {
-          d.append(c.delta[0] + ' ')
-          const b = el('b', null, '+' + c.delta[1])
+        d.textContent = c.delta.text
+        if (c.delta.gain != null && c.delta.gain > 0) {
+          d.appendChild(document.createTextNode(' '))
+          const b = el('b', null, '+' + c.delta.gain)
           d.appendChild(b)
-        } else {
-          d.textContent = c.delta[0]
         }
         card.appendChild(d)
       }
       impBox.appendChild(card)
     }
-
-    // 对比表（Stripe 模式：对齐列 · 一个容器 · 少边框）
-    const ba = im.beforeAfter
-    if (ba || enp) {
-      const card = el('div', 'cmp-card')
-      const tbl = el('table', 'cmp-table')
-      const thead = el('thead')
-      const hr = el('tr')
-      hr.appendChild(el('th', null, ''))
-      hr.appendChild(el('th', null, '装前 · 历史'))
-      hr.appendChild(el('th', null, '装后 · 现在'))
-      hr.appendChild(el('th', null, enp ? '若移除 · 预估' : ''))
-      thead.appendChild(hr)
-      tbl.appendChild(thead)
-      const tbody = el('tbody')
-      const row = (k, pre, post, est, postCls, estCls) => {
-        const tr = el('tr')
-        tr.appendChild(el('td', null, k))
-        const t1 = el('td', pre == null ? 'dim' : null, pre == null ? '—' : pre)
-        const t2 = el('td', postCls || null, post == null ? '—' : post)
-        const t3 = el('td', estCls || (est == null ? 'dim' : null), est == null ? '—' : est)
-        tr.append(t1, t2, t3)
-        return tr
-      }
-      tbody.appendChild(row('可用度', null, im.availability != null ? im.availability + '%' : '—',
-        enp ? enp.availabilityPct + '%' : null, 'hi', enp ? 'lo' : null))
-      if (ba) {
-        tbody.appendChild(row('错误率', ba.pre.errorRatePct + '%', ba.post.errorRatePct + '%', null))
-        tbody.appendChild(row('空回复率', ba.pre.emptyRatePct + '%', ba.post.emptyRatePct + '%', null))
-      }
-      tbl.appendChild(tbody)
-      card.appendChild(tbl)
-      if (ba) {
-        card.appendChild(el('div', 'cmp-note',
-          '装前 ' + ba.pre.requests + ' · 装后 ' + ba.post.requests + ' 请求 · 边界自动检测（首次透明切换 ' + esc(ba.boundary) + '）'))
-      }
-      if (enp) {
-        card.appendChild(el('div', 'cmp-note',
-          '若移除依据：' + enp.wouldFail + ' 个切换请求预算超模型上限 → 推理烧尽 → 掐流（87db83cd 实证，重试 5 次全败）；装前健康是 4000 预算时代且 glm 优先路由，条件不同'))
-      }
-      impBox.appendChild(card)
+    // 一行小字承载被替换的上下文（请求量/时延/依据），不再占卡位
+    const ctx = []
+    if (im.requests != null) ctx.push(im.requests + ' 请求（' + im.windowDays + 'd）')
+    if (im.medianTtftS != null) ctx.push('首字节中位 ' + im.medianTtftS + 's')
+    if (im.medianDurationS != null) ctx.push('总耗时 ' + im.medianDurationS + 's')
+    if (ba && ba.boundary) ctx.push('边界 ' + esc(ba.boundary) + ' 自动检测')
+    if (enp) ctx.push('若移除依据：切换请求预算超限→掐流（87db83cd 实证）')
+    if (ctx.length) {
+      const m = el('div', 'delta kpi-ctx')
+      m.textContent = ctx.join(' · ')
+      impBox.appendChild(m)
     }
   }
 
