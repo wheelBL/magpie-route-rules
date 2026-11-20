@@ -100,6 +100,35 @@ function render(o) {
       box.appendChild(cap)
       impBox.appendChild(box)
     }
+
+    // 反事实估计：若现在移除插件（当前预算与路由不变）
+    const enp = im.estimatedNoPlugin
+    if (enp) {
+      const eb = document.createElement('div')
+      eb.style.margin = '10px 0 0'
+      eb.style.padding = '10px 14px'
+      eb.style.border = '1px solid var(--border-strong)'
+      eb.style.borderRadius = '8px'
+      const eh = document.createElement('div')
+      eh.style.fontSize = '12px'
+      eh.style.marginBottom = '4px'
+      eh.textContent = '若现在移除插件（当前预算与路由不变）——预估'
+      eb.appendChild(eh)
+      const el2 = document.createElement('div')
+      el2.style.fontSize = '12px'
+      const strong = document.createElement('b')
+      strong.textContent = '可用度预计 ' + enp.availabilityPct + '%'
+      el2.appendChild(strong)
+      el2.appendChild(document.createTextNode('（当前 ' + (im.availability != null ? im.availability : '—') + '%）：' + enp.wouldFail + ' 个切换保障的请求预计以掐流/超限失败'))
+      eb.appendChild(el2)
+      const ec = document.createElement('div')
+      ec.className = 'muted'
+      ec.style.fontSize = '11px'
+      ec.style.marginTop = '3px'
+      ec.textContent = '依据：预算超模型上限→推理烧尽→掐流（session-87db83cd 实证：重试 5 次全败）；与"装前历史"不同——装前是 4000 预算时代且 glm 优先路由，本就健康'
+      eb.appendChild(ec)
+      impBox.appendChild(eb)
+    }
   }
 
   // ── 模型优先级 ──

@@ -775,6 +775,14 @@ def compute_impact(usage_path, now_ms, window_days=7):
         "switchGuaranteedPct": round(100.0 * saves / total, 1),
         "medianTtftS": med(ttfts),
         "medianDurationS": med(durations),
+        # 反事实估计（用户明确要求"预计没有用的时候会怎么样"）：若现在移除
+        # 插件（当前预算与路由不变），切换保障的请求预计以掐流/超限失败——
+        # 预算超上限→推理烧尽→掐流有 session-87db83cd 实证（重试 5 次全败）。
+        # 与"装前历史"区分：装前是 4000 预算时代且路由 glm 优先，本就健康。
+        "estimatedNoPlugin": {
+            "availabilityPct": round(100.0 * max(0, ok - saves) / total, 1),
+            "wouldFail": saves,
+        },
         "beforeAfter": before_after,
     }
 
