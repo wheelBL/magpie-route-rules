@@ -614,6 +614,35 @@ def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_
     return ai_chat(messages, args, candidates, max_tokens=2000)
 
 
+def norm_model(s):
+    return str(s).lower().replace(".", "-").replace("_", "-")
+
+
+def same_model(a, b):
+    na, nb = norm_model(a), norm_model(b)
+    return na == nb or na.startswith(nb) or nb.startswith(na)
+
+
+def resolve_attribution(row, provider, model, known_ids):
+    """归因到实际服务模型（AI 反思建议：按 req/served 分开归因）：
+    served（上游回显）优先——cannbot 链内切换的请求性能/失败/能力
+    应记到真正服务的模型头上，而不是代理所见的 model 字段。
+    匹配规则：归一化后与已知候选前缀匹配，多条命中取最长（防
+    glm-5.3 与 glm-5.3-flash 歧义）；无 served 或匹配不上退回 model。"""
+    served = str(row.get("served") or "")
+    if served and known_ids:
+        base = norm_model(served.split("/")[-1])
+        best = None
+        for cand in known_ids:
+            nb = norm_model(str(cand).split("/")[-1])
+            if base == nb or base.startswith(nb):
+                if best is None or len(nb) > len(norm_model(best.split("/")[-1])):
+                    best = cand
+        if best:
+            return best
+    return "%s/%s" % (provider, model) if provider else model
+
+
 def compute_impact(usage_path, now_ms, window_days=7):
     """从 usage 历史量化插件效果（7 天滚动窗口）：
     - saves: model≠served 且 200 = 透明切换挽救的请求（预算切换/流重试/链重试）
@@ -623,13 +652,6 @@ def compute_impact(usage_path, now_ms, window_days=7):
     - medianTtftS/medianDurationS: 200 请求的首字节/总耗时中位数（秒）。"""
     import datetime
     window_ms = window_days * 24 * 3600 * 1000
-
-    def norm_model(s):
-        return str(s).lower().replace(".", "-").replace("_", "-")
-
-    def same_model(a, b):
-        na, nb = norm_model(a), norm_model(b)
-        return na == nb or na.startswith(nb) or nb.startswith(na)
 
     saves = 0
     ok = 0
@@ -824,6 +846,14 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
     view = {
         "generatedAt": time.strftime("%Y-%m-%d %H:%M"),
         "bucket": {"key": cur_bkey, "label": bucket_label(cur_bkey)},
+        # 评分口径透明化（AI 反思建议）：公式/窗口/门槛全公开，可独立核验
+        "scoring": {
+            "score": "tps ÷ (1+连败) × 首字节惩罚 ÷ (1+ttfb秒/10)；TTFB 需 ttfbSamples≥3",
+            "buckets": "周末×时段4桶共8桶，各自 EWMA(0.7/0.3)；桶内样本≥3 优先于全局分",
+            "reorder": "评分降序换头，挑战者需超现任 15%（迟滞防抖）；样本≥5 参与；capabilityDegraded 匹配规则类型 ×0.1；桶失败率再除 (1+2×rate)",
+            "fastTps": "快窗 EWMA(0.3/0.7≈最近3样本) vs 慢窗(0.7/0.3)；<0.6 且样本≥5 → 趋势恶化告警",
+            "attribution": "perf/失败/能力按 served（上游回显，归一化最长前缀匹配已知候选）归因；无回显退回 model 字段",
+        },
         "perfSummary": perf_summary[:8],
         "insights": insights[:10],
         "imagesView": {m: {"state": v.get("state"), "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
@@ -1315,6 +1345,13 @@ def main():
         return None
 
     window_fails = {}
+    # 已知模型全集（归因候选）：规则候选 + 既有画像键
+    known_ids = set(targets) | set(perf.keys())
+    for r in options.get("rules") or []:
+        for c in [r.get("target")] + list(r.get("fallbacks") or []):
+            if c:
+                known_ids.add(c)
+
     for line in lines:
         if not line.strip():
             continue
@@ -1338,7 +1375,9 @@ def main():
         if not model:
             scan_diag["noModel"] += 1
             continue
-        model_key = "%s/%s" % (provider, model) if provider else model
+        # 归因到实际服务模型：served 回显优先匹配已知候选（规则候选/已有画像），
+        # 链内切换的请求性能记到真正干活的模型头上。
+        model_key = resolve_attribution(row, provider, model, known_ids)
 
         # 每个完成请求都进性能画像：吞吐率/首字节 EWMA + 连败计数（稳定性）。
         # 200 归零连败（自恢复），>=400 累加。
@@ -1683,7 +1722,9 @@ def main():
         scored = []
         for m in cands:
             pstats = perf.get(m)
-            if pstats and (pstats.get("samples") or 0) >= 2:
+            # 重排样本门槛 ≥5（AI 反思：18 样本与 1588 样本跨模型比较噪音大，
+            # 原 ≥2 门槛太宽；桶内分另有 ≥3 门槛）
+            if pstats and (pstats.get("samples") or 0) >= 5:
                 s = perf_score_now(pstats, now_ms)
                 # 能力标记 → 路由可用性联动：能力降级的成员在此类规则中大幅降权
                 # （capabilityDegraded 类型与规则类型一致才降权——images 降级只影响 images 规则）
