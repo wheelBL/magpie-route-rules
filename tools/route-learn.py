@@ -173,6 +173,12 @@ def rule_classify(row, clamp_skip_providers):
         return {"kind": "clampOutput", "cap": int(m.group(1)), "ttlMs": CLAMP_TTL_MS}
     if m:
         return {"kind": "ignore", "ttlMs": CLAMP_TTL_MS}
+    # 输入长度超限 ≠ 输出钳制（另一机器误触发实证：错误说 input 超过模型上限
+    # 344064，被当成 clampOutput——钳 max_tokens 治不了输入超长）。输入超限
+    # 归 payload 学习（payloadCaps）与用户自行缩减，学习侧只 ignore。
+    if re.search(r"(input|prompt|context)[^.\n]{0,40}(length|tokens?)[^.\n]{0,40}(exceed|limit|maximum|long|large)", err) \
+            or "prompt is too long" in err or "context length" in err:
+        return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
     # Rate limiting / upstream down: pause the model for a while. The exact
     # duration comes from the exponential backoff (the caller decides).
     if status == 429 or "rate limit" in err or "too many requests" in err:
@@ -245,12 +251,16 @@ def bucket_label(bkey):
 
 
 def perf_score_bucket(pstats, bkey):
-    """时段桶内评分：样本 ≥3 且有吞吐率数据时优先于全局分（更贴近当下）。"""
+    """时段桶内评分：样本 ≥3 且有吞吐率数据时优先于全局分（更贴近当下）。
+    失败率惩罚：rate>0 直接除 (1+2*rate)——小样本高失败桶（另一机器实证：
+    2/3 失败率被旧规则忽略）也能实际压低评分驱动降级。"""
     b = (pstats.get("buckets") or {}).get(bkey)
     if b and (b.get("samples") or 0) >= 3 and b.get("ewmaTps"):
         ttfb = b.get("ewmaTtfbMs")
         pen = 1.0 / (1.0 + (ttfb / 1000.0) / 10.0) if isinstance(ttfb, (int, float)) and ttfb > 0 else 1.0
-        return round(b["ewmaTps"] / (1 + (b.get("consecFails") or 0)) * pen, 1)
+        bf, bs = b.get("fails") or 0, b.get("samples") or 0
+        fail_pen = 1.0 / (1.0 + 2.0 * (bf / bs)) if bs > 0 else 1.0
+        return round(b["ewmaTps"] / (1 + (b.get("consecFails") or 0)) * pen * fail_pen, 1)
     return None
 
 
@@ -519,8 +529,10 @@ AI_PROMPT = (
     '{"kind":"pause|clampOutput|ignore","ttlMs":<数字>,"cap":<数字或省略>,"reason":"一句话中文"}\n'
     "kind 含义：\n"
     "- pause：上游暂时不可用/限流/超时，暂停该模型一段时间（ttlMs 取 60000~86400000）\n"
-    "- clampOutput：请求参数超限（如 max_tokens 超过模型实际上限），把输出预算钳制到 cap\n"
-    "- ignore：客户端取消、一次性抖动或无需处理\n"
+    "- clampOutput：仅限输出参数超限（max_tokens/output 超过模型实际上限）。"
+    "**输入长度超限（input/prompt/context 超长）绝不能 clampOutput**——钳输出治不了输入超长，"
+    "那种情况选 ignore（payload 学习另行处理）。\n"
+    "- ignore：客户端取消、一次性抖动、输入超长或无需处理\n"
     "记录："
 )
 
@@ -786,15 +798,17 @@ def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, i
             insights.append({"level": "info",
                              "text": "%s 性能样本已 %.0f 小时未更新（无流量或采集停滞，评分可能不反映现状）"
                                      % (m, age_h)})
-    # 2d. 桶级失败集中（反思建议"桶级失败上卷"）：某时段桶失败 ≥3 且样本 ≥5
-    #     = 失败在特定时段聚集（如晚高峰），全局均值会掩盖它。
+    # 2d. 桶级失败集中（反思建议"桶级失败上卷"）：绝对量（fails≥3 且样本≥5）
+    #     或 小样本高失败率（fails≥2 且 rate≥50%——另一机器实证 2/3 失败率
+    #     被绝对量阈值漏掉）——后者是"低样本高失败桶未触发降级"的修复。
     for m, p in perf.items():
         for bkey, b in (p.get("buckets") or {}).items():
             bf, bs = b.get("fails") or 0, b.get("samples") or 0
-            if bf >= 3 and bs >= 5:
+            rate = (bf / bs) if bs > 0 else 0
+            if (bf >= 3 and bs >= 5) or (bf >= 2 and rate >= 0.5):
                 insights.append({"level": "warn",
-                                 "text": "%s 在 %s 时段失败集中（%d/%d）——该时段应自动降权，持续则人工检查"
-                                         % (m, bucket_label(bkey), bf, bs)})
+                                 "text": "%s 在 %s 时段失败集中（%d/%d，%.0f%%）——该时段应自动降权，持续则人工检查"
+                                         % (m, bucket_label(bkey), bf, bs, rate * 100)})
     # 3. 从未被试探的候选：能力未知（可能是从未有过带图/该类流量的模型）
     unsampled = [m for m, p in perf.items() if int(p.get("samples") or 0) == 0]
     if unsampled:
