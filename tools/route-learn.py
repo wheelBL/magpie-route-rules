@@ -176,7 +176,7 @@ def rule_classify(row, clamp_skip_providers):
     # 输入长度超限 ≠ 输出钳制（另一机器误触发实证：错误说 input 超过模型上限
     # 344064，被当成 clampOutput——钳 max_tokens 治不了输入超长）。输入超限
     # 归 payload 学习（payloadCaps）与用户自行缩减，学习侧只 ignore。
-    # 模式容忍上游拼写误差（实测 "excced"）与 max/maximum 变体。
+    # 模式容错拼写变体（exc[ce]ed）与 max/maximum 变体——正则多容错无成本。
     if re.search(r"input too long|exc[ce]ed max input|max input length|prompt is too long|context length|input length.{0,60}\d{4,}", err):
         return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
     # Rate limiting / upstream down: pause the model for a while. The exact
