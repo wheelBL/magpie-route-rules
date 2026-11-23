@@ -60,9 +60,15 @@ function ensureCompanion() {
   }
   const tr = `"${python}" "${script}" --quiet`
   const created = run(["schtasks", "/create", "/tn", TASK_NAME, "/tr", tr, "/sc", "minute", "/mo", "5", "/f"])
-  console.log(created.code === 0
-    ? `route-rules companion: task ${existing ? "repointed" : "registered"} -> ${script}`
-    : `route-rules companion: schtasks failed (${created.code}): ${created.out.trim().slice(0, 160)}`)
+  if (created.code === 0) {
+    // a fresh install or repoint must not sit out the scheduler's up-to-
+    // 5-minute silence: fire the first learning pass right now
+    const fired = run(["schtasks", "/run", "/tn", TASK_NAME])
+    console.log(`route-rules companion: task ${existing ? "repointed" : "registered"} -> ${script}`
+      + (fired.code === 0 ? "；已立即触发首轮学习" : "；立即触发失败，等下一 5 分钟节拍"))
+  } else {
+    console.log(`route-rules companion: schtasks failed (${created.code}): ${created.out.trim().slice(0, 160)}`)
+  }
 }
 
 export const RouteRulesCompanion = async () => {

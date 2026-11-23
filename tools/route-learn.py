@@ -1229,7 +1229,10 @@ def bootstrap(entry, args, key):
         if probe.returncode != 0 or target.lower() not in run_cmd.lower():
             subprocess.run(["schtasks", "/create", "/tn", "Magpie route learn", "/tr", tr,
                             "/sc", "minute", "/mo", "5", "/f"], check=True, timeout=20)
-            task_note = "；已注册/重指向计划任务（每 5 分钟，指向 %s）" % target
+            fired = subprocess.run(["schtasks", "/run", "/tn", "Magpie route learn"],
+                                   capture_output=True, timeout=20)
+            task_note = "；已注册/重指向计划任务（每 5 分钟，指向 %s）%s" % (
+                target, "，已立即触发首轮学习" if fired.returncode == 0 else "；立即触发失败，等下一节拍")
         else:
             task_note = "；计划任务已存在且指向包内脚本"
     except Exception as err:
