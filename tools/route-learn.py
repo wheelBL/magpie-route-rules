@@ -1773,7 +1773,10 @@ def main():
                     pc["at"] = now_ms
 
         # 200 行的大输入 = 承载证据下界（与 413 上界夹逼真实上限）
-        in_tok_ok = row.get("in")
+        # 200 行的大输入 = 承载证据下界（与 413 上界夹逼真实上限）。
+        # in 只记 cache-miss tokens：前缀缓存命中的大请求 in 会缩成几百，但完整
+        # prompt 仍证明了模型装得下——证据必须用 in + cache_read（0.3.54）。
+        in_tok_ok = (row.get("in") or 0) + (row.get("cache_read") or 0)
         if status == 200 and isinstance(in_tok_ok, (int, float)) and in_tok_ok > 1000:
             pc2 = payload_caps.setdefault(model_key, {})
             pc2["maxOkTok"] = max(pc2.get("maxOkTok") or 0, int(in_tok_ok))
