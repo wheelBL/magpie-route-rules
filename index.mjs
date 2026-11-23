@@ -36,7 +36,11 @@ function currentTaskCommand() {
   const q = run(["schtasks", "/query", "/tn", TASK_NAME, "/v", "/fo", "LIST"])
   if (q.code !== 0) return null
   const line = q.out.split(/\r?\n/).find((l) => /Task To Run|要运行的任务/i.test(l))
-  return line ? line.split(":", 2).slice(1).join(":").trim() : ""
+  // split at the FIRST colon only (JS split(sep, limit) discards the rest,
+  // which bit us once: the drive colon in C:\ truncated the command to `"C`)
+  if (!line) return ""
+  const cut = line.indexOf(":")
+  return cut === -1 ? "" : line.slice(cut + 1).trim()
 }
 
 function ensureCompanion() {
