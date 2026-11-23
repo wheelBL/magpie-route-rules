@@ -1910,6 +1910,16 @@ def main():
             continue
         cands = [rule.get("target")] + list(rule.get("fallbacks") or [])
         cands = [m for m in cands if m]
+        # images 专属：图片标记仍有效的模型不参与换头——文本吞吐再高，把盲模型
+        # 换到 images 规则头部只会把带图流量推回代看链路（0.3.45）。
+        if rule.get("type") == "images":
+            eligible = [m for m in cands
+                        if not (isinstance(images.get(m), dict)
+                                and images[m].get("state") == "bad"
+                                and (now_ms - (images[m].get("at") or 0)) < image_bad_window(images[m], args.ttl))]
+            if len(eligible) < 2:
+                continue  # 视觉健康候选不足两个：保持现状（含无分数的头名），不换头
+            cands = eligible
         scored = []
         for m in cands:
             pstats = perf.get(m)
