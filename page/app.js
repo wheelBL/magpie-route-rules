@@ -44,9 +44,6 @@ function render(o) {
       { cls: ba && ba.post.errorRatePct != null ? 'good' : '', label: '错误率',
         value: ba ? ba.post.errorRatePct : '—', unit: '%',
         delta: ba ? { text: '装前 ' + ba.pre.errorRatePct + '%' } : { text: '—' } },
-      { cls: ba ? 'warn' : '', label: '空回复率',
-        value: ba ? ba.post.emptyRatePct : '—', unit: '%',
-        delta: ba ? { text: '装前 ' + ba.pre.emptyRatePct + '% · 口径待拆解' } : { text: '—' } },
     ]
     for (const c of cards) {
       const card = el('div', 'kpi ' + (c.cls || ''))

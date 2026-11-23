@@ -939,15 +939,8 @@ def compute_impact(usage_path, now_ms, window_days=7):
                 era = "pre" if ts_ms < first_switch_ms else "post"
                 if status == 200:
                     eras[era]["ok"] += 1
-                    # 空回复口径（7d 实测拆解修正）：只算真实用户请求——
-                    # 剔 agent=magpie 内部调用（classify 等 out=0 正常）、
-                    # 剔 in=0 行（超长操作未记录输入，跨时代不可比）。
-                    out_v = row.get("out")
-                    in_v = row.get("in")
-                    if (isinstance(out_v, (int, float)) and out_v == 0
-                            and agent != "magpie"
-                            and isinstance(in_v, (int, float)) and in_v > 0):
-                        eras[era]["empty"] += 1
+                    # （空回复率卡已删 0.3.58：口径修正后两时代恒 0.0%，无优势故事；
+                    #  空回复在扫描侧仍按内容依赖失败处理，不进服务失败口径）
                 elif isinstance(status, int) and status >= 400:
                     # 499 = 客户端主动取消（实测 7d 的 0.1% 错误率 15/16 是它），
                     # 不是服务失败——剔出错误率。
@@ -960,7 +953,6 @@ def compute_impact(usage_path, now_ms, window_days=7):
                 return {
                     "requests": t,
                     "errorRatePct": round(100.0 * e["fail"] / t, 1),
-                    "emptyRatePct": round(100.0 * e["empty"] / t, 1),
                 }
             pre_s, post_s = era_stats(eras["pre"]), era_stats(eras["post"])
             if pre_s and post_s:
