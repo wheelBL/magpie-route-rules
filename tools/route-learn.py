@@ -1240,12 +1240,143 @@ def bootstrap(entry, args, key):
     return summary + task_note
 
 
+# ── DSH 容量回写（0.3.52）：让自动 compact 用真实窗口 ──
+# DSH 的自动 compact 阈值 = min(0.8×contextWindow, window−maxTokens−65536)，
+# 而 magpie /v1/models 对所有模型都报假 1M（二进制无输入窗口旋钮），DSH 的
+# settings.yaml/patch 配置条目优先级又最高——所以把 payload 夹逼学到的真实
+# 容量回写进 DSH 配置。magpie dsh 同步会重置回 1M，每轮（5 分钟）回写自愈。
+# 只写证据值（maxOkTok 优先：实测放行过）；低于 maxTokens+headroom+余量下限
+# 的跳过（防 compaction 配置崩）；非默认 1M 也非我方旧值的数字视作用户手设，
+# 尊重不动。
+
+DSH_SETTINGS = os.path.join(os.path.expanduser("~"), ".dsh", "settings.yaml")
+DSH_PROFILES = os.path.join(os.path.expanduser("~"), ".dsh", "profiles")
+MAGPIE_DEFAULT_WINDOW = 1048576  # magpie 目录缺报时的默认假窗口
+WRITEBACK_FLOOR_EXTRA = 32768    # window 至少比 maxTokens+65536 多这么多
+
+
+def _atomic_write_text(path, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-", suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        if os.path.exists(path):
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _model_blocks(text):
+    """每个 '- id: <x>' 列表项的 (model_id, 起始行, 结束行)。文本级、缩进感知、
+    保留原格式；只关心块内含 contextWindow 字段的（嵌套模型条目）。"""
+    lines = text.split("\n")
+    hits = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)-\s+id:\s*(\S+)\s*$", line)
+        if not m:
+            continue
+        indent, model_id = m.group(1), m.group(2)
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() and not nxt.startswith(indent + " "):
+                break
+            j += 1
+        if any(re.match(r"^\s+contextWindow:\s*\d+\s*$", b) for b in lines[i:j]):
+            hits.append((model_id, i, j))
+    return hits
+
+
+def writeback_dsh_windows(payload_caps, state, quiet, dry_run=False, files=None):
+    """把学到的真实容量回写 DSH 配置的 contextWindow，返回是否有修改。"""
+    if not payload_caps or not isinstance(state, dict):
+        return False
+    if files is None:
+        files = []
+        if os.path.isfile(DSH_SETTINGS):
+            files.append(DSH_SETTINGS)
+        if os.path.isdir(DSH_PROFILES):
+            for name in sorted(os.listdir(DSH_PROFILES)):
+                p = os.path.join(DSH_PROFILES, name, "cordis.patch.yml")
+                if os.path.isfile(p):
+                    files.append(p)
+    wrote = state.setdefault("dshWindows", {})
+    user_set = state.setdefault("dshWindowsUserSet", {})
+    any_change = False
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        lines = text.split("\n")
+        notes = []
+        dirty = False
+        for model_id, start, end in _model_blocks(text):
+            pc = payload_caps.get(model_id)
+            if not isinstance(pc, dict):
+                continue
+            ok_tok = pc.get("maxOkTok")
+            fail_tok = pc.get("minFailTok")
+            target = int(ok_tok) if isinstance(ok_tok, (int, float)) and ok_tok > 0 \
+                else (int(fail_tok) if isinstance(fail_tok, (int, float)) and fail_tok > 0 else None)
+            if target is None:
+                continue
+            cw_idx = cw_indent = None
+            cw_val = mt_val = 0
+            for k in range(start, end):
+                m = re.match(r"^(\s+)contextWindow:\s*(\d+)\s*$", lines[k])
+                if m:
+                    cw_idx, cw_indent, cw_val = k, m.group(1), int(m.group(2))
+                    break
+            if cw_idx is None:
+                continue
+            for k in range(start, end):
+                m = re.match(r"^\s+maxTokens:\s*(\d+)\s*$", lines[k])
+                if m:
+                    mt_val = int(m.group(1))
+                    break
+            key = "%s|%s" % (os.path.relpath(path, os.path.expanduser("~")), model_id)
+            floor = mt_val + 65536 + WRITEBACK_FLOOR_EXTRA
+            if target < floor:
+                if cw_val == MAGPIE_DEFAULT_WINDOW and not user_set.get(key):
+                    notes.append("%s 跳过（证据 %d < 下限 %d）" % (model_id, target, floor))
+                continue
+            if cw_val == target:
+                wrote[key] = target
+                continue
+            if cw_val != MAGPIE_DEFAULT_WINDOW and wrote.get(key) != cw_val:
+                if not user_set.get(key):
+                    user_set[key] = cw_val
+                    notes.append("%s 尊重手设 %d（证据 %d）" % (model_id, cw_val, target))
+                continue
+            lines[cw_idx] = "%scontextWindow: %d" % (cw_indent, target)
+            wrote[key] = target
+            user_set.pop(key, None)
+            dirty = True
+            notes.append("%s %d→%d" % (model_id, cw_val, target))
+        if not dirty:
+            continue
+        any_change = True
+        if not dry_run:
+            backup(path)
+            _atomic_write_text(path, "\n".join(lines))
+        log("容量回写 %s：%s" % (os.path.basename(path), "；".join(notes)), quiet)
+    return any_change
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--no-ai", action="store_true", help="unknown signatures get the conservative default instead of an AI verdict")
+    ap.add_argument("--no-dsh-writeback", action="store_true", help="skip writing learned payload capacities into DSH contextWindow configs")
     ap.add_argument("--usage", default=DEFAULT_USAGE)
     ap.add_argument("--plugins", default=DEFAULT_PLUGINS)
     ap.add_argument("--state", default=DEFAULT_STATE)
@@ -1979,6 +2110,9 @@ def main():
         backup(args.plugins)
         entry["options"] = options
         atomic_write_json(args.plugins, plugins)
+    # ── DSH 容量回写（0.3.52）：真实窗口写进 DSH 配置，自动 compact 在正确位置触发 ──
+    if not args.no_dsh_writeback:
+        writeback_dsh_windows(payload_caps, state, args.quiet, dry_run=args.dry_run)
     new_offset_state = dict(state)
     new_offset_state["offset"] = new_offset
     if args.dry_run:
