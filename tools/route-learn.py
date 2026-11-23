@@ -418,8 +418,9 @@ def probe_image_capability(key, model, known, timeout=90):
     described"). The fallback writes each described image into
     vision-cache.jsonl keyed by content, so a fresh random probe image that
     produces a new entry means the model saw a description, not the image.
-    When the describer pool is dry the 502 names the model ("model X can't see
-    images") — also a direct mark.
+    When the describer pool is dry magpie names the model ("model X can't see
+    images", or the 400 fast-fail "does not support image input") — also a
+    direct mark.
 
     Returns {'ok', 'via': 'native'|'describe'|None, 'who', 'served'}.
     'who' is the model to attribute: the 502 names the real culprit; a 200 is
@@ -433,7 +434,7 @@ def probe_image_capability(key, model, known, timeout=90):
                {"type": "image_url", "image_url": {"url": unique_probe_png()}}]
     status, body = probe_call(key, model, content, timeout)
     if status != 200:
-        named = re.search(r'model\s+\\?"([A-Za-z0-9@._:/-]+)\\?"\s+can\'?t see images', body or "")
+        named = re.search(r'model\s+\\?"([A-Za-z0-9@._:/-]+)\\?"\s+(?:can\'?t see images|does not support image input)', body or "")
         if named:
             return {"ok": False, "via": "describe", "who": named.group(1), "served": named.group(1)}
         return {"ok": False, "via": None, "who": model, "served": None}
@@ -1418,6 +1419,11 @@ def main():
                 state["perf"] = raw["perf"]
             if isinstance(raw.get("diag"), dict):
                 state["diag"] = raw["diag"]
+            # 持久字段一并带过（0.3.47 修：曾遗漏——lastAiReflectAt 丢失 → 24h 门读到 0，
+            # AI 反思每 5 分钟重跑；ignore_sigs 丢失 → 已忽略签名反复进 AI 分类）
+            for k in ("lastAiReflectAt", "lastReflect", "insights", "ignore_sigs"):
+                if raw.get(k) is not None:
+                    state[k] = raw[k]
     except Exception:
         pass
     success = state["success"]
