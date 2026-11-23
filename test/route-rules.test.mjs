@@ -173,6 +173,23 @@ test('学习：TTL 过期的 bad 视为 unknown，恢复首选试探', () => {
   assert.equal(out.model, 'cannbot/deepseek-v4.1-flash')
 })
 
+test('学习：via=describe 的原生无视觉标记超过 TTL 仍视为 incapable', () => {
+  const learned = { images: { 'cannbot/deepseek-v4.1-flash': { state: 'bad', via: 'describe', at: Date.now() - 7 * 24 * 3600e3 } } }
+  const out = onRequest(imgBody(), ctx(imgOpts({ learned })))
+  assert.equal(out.model, 'cannbot/glm-5.3', 'describe 标记不会衰减为 unknown → 跳过该候选')
+})
+
+test('学习：全部候选 via=describe → 仍 fail-open 回落首选', () => {
+  const now = Date.now()
+  const learned = { images: {
+    'cannbot/deepseek-v4.1-flash': { state: 'bad', via: 'describe', at: now },
+    'cannbot/glm-5.3': { state: 'bad', via: 'describe', at: now },
+    'cannbot/qwen3.8-max': { state: 'bad', via: 'describe', at: now },
+  } }
+  const out = onRequest(imgBody(), ctx(imgOpts({ learned })))
+  assert.equal(out.model, 'cannbot/deepseek-v4.1-flash')
+})
+
 test('学习：标 good 的模型优先于未知候选', () => {
   const learned = { images: { 'cannbot/qwen3.8-max': { state: 'good', at: Date.now() } } }
   const out = onRequest(imgBody(), ctx(imgOpts({ learned })))

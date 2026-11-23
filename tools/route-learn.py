@@ -3,11 +3,17 @@
 learned actions to the magpie-route-rules gateway middleware.
 
 Two learning channels:
-1. Image capability (0.2.0): a model whose image request fails (406 /
-   multimodal-flavoured errors) is marked bad for a TTL in
-   options.learned.images — later image requests skip it. The TTL is the
-   half-open probe: when it expires, traffic flows again and real outcomes
-   re-teach the mark.
+1. Image capability (0.2.0; native-vs-describe since 0.3.44): a model
+   whose image request fails (406 / multimodal-flavoured errors) is marked
+   bad for a TTL in options.learned.images — later image requests skip it.
+   The TTL is the half-open probe: when it expires, traffic flows again and
+   real outcomes re-teach the mark. A plain 200 proves nothing, though:
+   magpie silently describes images for vision-less models via the Image
+   recognition pool, and the describe fallback writes each described image
+   into vision-cache.jsonl. Probes send a fresh random image per run; a new
+   cache entry (or a 502 naming the model in "can't see images") means the
+   model saw a description, not the image → mark via='describe' (natively
+   vision-less, re-verified weekly, never preferred for image routing).
 2. Failure actions (0.3.0): every failure signature (model + status +
    normalised error) gets a handling action in options.learned.actions:
      {model, kind: 'pause'|'clampOutput'|'ignore', cap?, ttlMs, at, by}
@@ -42,19 +48,24 @@ Usage:
 
 Exit codes: 0 ok, 1 error, 2 AI classifier unavailable.
 """
-
 import argparse
+import base64
+import binascii
+import datetime
 import hashlib
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
+from collections import deque
 
 DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "magpie")
 DEFAULT_USAGE = os.path.join(DEFAULT_CONFIG_DIR, "usage.jsonl")
@@ -70,6 +81,7 @@ KEEP_BACKUPS = 5
 USER_AGENT = "magpie-route-learn/0.2"
 GATEWAY = "http://127.0.0.1:3425/v1/chat/completions"
 GATEWAY_MODELS = "http://127.0.0.1:3425/v1/models"
+VISION_CACHE = os.path.join(DEFAULT_CONFIG_DIR, "vision-cache.jsonl")
 DSH_ENV = os.path.join(os.path.expanduser("~"), ".dsh", ".env")
 DEFAULT_PAUSE_BASE = 2 * 60 * 1000
 DEFAULT_PAUSE_MAX = 60 * 60 * 1000
@@ -77,6 +89,7 @@ PAUSE_TTL_MS = 10 * 60 * 1000
 IGNORE_TTL_MS = 30 * 24 * 3600 * 1000
 CLAMP_TTL_MS = 24 * 3600 * 1000
 SUCCESS_KEEP = 20
+DESCRIBE_REPROBE_MS = 7 * 24 * 3600 * 1000  # via='describe' marks: re-verify weekly
 
 
 def log(msg, quiet):
@@ -271,17 +284,47 @@ def perf_score_now(pstats, now_ms=None):
     return perf_score_bucket(pstats, bucket_key(now_ms)) or perf_score(pstats)
 
 
-TINY_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+def unique_probe_png():
+    """8x8 random-RGB PNG data URL — fresh content on every probe so magpie's
+    vision cache (content-addressed) can never serve a stale description and
+    hide whether this request went through the describe fallback."""
+    w = h = 8
+    rnd = os.urandom(w * h * 3)
+    raw = b"".join(b"\x00" + rnd[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", binascii.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
 
-def probe_model(key, model, images=False, timeout=90):
-    """Tiny probe request: True = healthy (200). Used for early pause-recovery
-    detection and proactive image-capability discovery."""
-    if images:
-        content = [{"type": "text", "text": "这张图是什么颜色"},
-                   {"type": "image_url", "image_url": {"url": TINY_PNG}}]
-    else:
-        content = "ping"
+def vision_cache_keys():
+    """Keys currently in magpie's describe-fallback cache (vision-cache.jsonl).
+    Every image magpie describes lands there keyed by content."""
+    keys = set()
+    try:
+        with open(VISION_CACHE, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    key = json.loads(line).get("key")
+                except ValueError:
+                    continue
+                if key:
+                    keys.add(key)
+    except OSError:
+        pass
+    return keys
+
+
+def probe_call(key, model, content, timeout=90):
+    """One tiny request; (status, body text). status < 0 = network error."""
     payload = {"model": model, "messages": [{"role": "user", "content": content}],
                "max_tokens": 16, "stream": False}
     req = urllib.request.Request(GATEWAY, data=json.dumps(payload).encode(), headers={
@@ -290,9 +333,129 @@ def probe_model(key, model, images=False, timeout=90):
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status == 200
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as err:
+        try:
+            return err.code, err.read().decode("utf-8", "replace")
+        except Exception:
+            return err.code, ""
     except Exception:
-        return False
+        return -1, ""
+
+
+def probe_model(key, model, content="ping", timeout=90):
+    """Tiny probe: True = healthy (200). Used for early pause-recovery."""
+    status, _ = probe_call(key, model, content, timeout)
+    return status == 200
+
+
+def _usage_rows(limit=24):
+    rows = []
+    try:
+        with open(DEFAULT_USAGE, encoding="utf-8", errors="replace") as fh:
+            for line in deque(fh, maxlen=limit):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return rows
+
+
+def _usage_epoch(text):
+    if not isinstance(text, str) or len(text) < 19:
+        return None
+    try:
+        return datetime.datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def usage_resolved_model(started_at, known, attempts=3):
+    """Which model actually served the request we just sent. The middleware
+    masks the served name in response bodies, so read the usage tail: probe
+    rows carry agent='magpie'; only rows naming a known route candidate are
+    accepted, so the describe-call row (a describer model) is skipped."""
+    known = set(known or ())
+    for _ in range(attempts):
+        served = None
+        for row in _usage_rows():
+            if row.get("agent") != "magpie":
+                continue
+            at = _usage_epoch(row.get("t"))
+            if at is None or at < started_at - 5 or at > time.time() + 2:
+                continue
+            name = row.get("model")
+            if not isinstance(name, str) or not name:
+                continue
+            for cand in known:
+                if name == cand or cand.endswith("/" + name):
+                    served = cand
+                    break
+        if served:
+            return served
+        time.sleep(0.2)
+    return None
+
+
+def probe_image_capability(key, model, known, timeout=90):
+    """Image capability, separating native vision from magpie's describe
+    fallback (Settings → Models → Image recognition).
+
+    A plain 200 proves nothing: for a vision-less model magpie silently has a
+    describer turn the image into text and serves that (this used to mark such
+    models 'good', so image traffic kept flowing into the fallback until the
+    describer pool ran dry and every image request 502'd "image not
+    described"). The fallback writes each described image into
+    vision-cache.jsonl keyed by content, so a fresh random probe image that
+    produces a new entry means the model saw a description, not the image.
+    When the describer pool is dry the 502 names the model ("model X can't see
+    images") — also a direct mark.
+
+    Returns {'ok', 'via': 'native'|'describe'|None, 'who', 'served'}.
+    'who' is the model to attribute: the 502 names the real culprit; a 200 is
+    attributed to the model the usage log says served it. 'who' may differ
+    from the asked model because the middleware rewrites image requests to the
+    rule's own candidates.
+    """
+    before = vision_cache_keys()
+    started = time.time() - 1
+    content = [{"type": "text", "text": "这张图是什么颜色"},
+               {"type": "image_url", "image_url": {"url": unique_probe_png()}}]
+    status, body = probe_call(key, model, content, timeout)
+    if status != 200:
+        named = re.search(r'model\s+\\?"([A-Za-z0-9@._:/-]+)\\?"\s+can\'?t see images', body or "")
+        if named:
+            return {"ok": False, "via": "describe", "who": named.group(1), "served": named.group(1)}
+        return {"ok": False, "via": None, "who": model, "served": None}
+    seen = before
+    for _ in range(4):  # the cache write rides the same request; allow a settle
+        time.sleep(0.4)
+        seen = vision_cache_keys()
+        if seen - before:
+            break
+    described = bool(seen - before)
+    served = usage_resolved_model(started, known) or model
+    if described:
+        return {"ok": True, "via": "describe", "who": served, "served": served}
+    if served != model:
+        # rewritten to another candidate — this probe says nothing about the
+        # asked model's own vision; leave its mark alone.
+        return {"ok": True, "via": None, "who": None, "served": served}
+    return {"ok": True, "via": "native", "who": model, "served": served}
+
+
+def image_bad_window(entry, ttl_ms):
+    """How long a 'bad' image mark stays meaningful. via='describe' marks
+    encode a catalog-level property (no native vision), not a transient
+    failure: re-verify them weekly instead of on every TTL."""
+    if isinstance(entry, dict) and entry.get("via") == "describe":
+        return DESCRIBE_REPROBE_MS
+    return ttl_ms
 
 
 def ai_candidates(args, success, available, perf=None):
@@ -856,7 +1019,8 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
         },
         "perfSummary": perf_summary[:8],
         "insights": insights[:10],
-        "imagesView": {m: {"state": v.get("state"), "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
+        "imagesView": {m: {"state": v.get("state"), "via": v.get("via"),
+                           "ageMin": round((now_ms - (v.get("at") or 0)) / 60000)}
                        for m, v in images.items()},
         "actionsView": [{"model": a.get("model"), "kind": a.get("kind"),
                          "leftMin": max(0, round(((a.get("at") or 0) + (a.get("ttlMs") or 0) - now_ms) / 60000)),
@@ -892,7 +1056,7 @@ def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, i
     if image_targets:
         fresh_bad = [m for m in image_targets
                      if isinstance(images.get(m), dict) and images[m].get("state") == "bad"
-                     and (now_ms - (images[m].get("at") or 0)) < image_ttl_ms]
+                     and (now_ms - (images[m].get("at") or 0)) < image_bad_window(images[m], image_ttl_ms)]
         if len(fresh_bad) == len(image_targets):
             insights.append({"level": "warn",
                              "text": "图片候选全部不可用（%s）——带图请求将失败；检查网关或增补候选"
@@ -947,10 +1111,15 @@ def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, i
     # 5. images 拉黑即将到期：提示恢复试探即将开始
     for m, entry0 in images.items():
         if entry0.get("state") == "bad":
-            left_min = round(((entry0.get("at") or 0) + image_ttl_ms - now_ms) / 60000)
+            window = image_bad_window(entry0, image_ttl_ms)
+            left_min = round(((entry0.get("at") or 0) + window - now_ms) / 60000)
             if 0 < left_min <= 30:
-                insights.append({"level": "info",
-                                 "text": "%s 的图片拉黑还剩 %d 分钟到期——到期后将恢复带图试探" % (m, left_min)})
+                if entry0.get("via") == "describe":
+                    insights.append({"level": "info",
+                                     "text": "%s 的原生无视觉复核还有 %d 分钟——周度复核后将恢复带图试探" % (m, left_min)})
+                else:
+                    insights.append({"level": "info",
+                                     "text": "%s 的图片拉黑还剩 %d 分钟到期——到期后将恢复带图试探" % (m, left_min)})
                 break
     # 6. 评分排名与候选顺序的差距（自适应因防抖未换头的状态可见化）
     for rule in rules or []:
@@ -1137,12 +1306,16 @@ def main():
             print("  （无——尚无带图失败样本；所有候选按未知能力对待，允许试探）")
         for model, entry0 in images.items():
             state0 = entry0.get("state")
-            left_min = max(0, round(((entry0.get("at") or 0) + args.ttl - now) / 60000))
+            window = image_bad_window(entry0, args.ttl)
+            left_min = max(0, round(((entry0.get("at") or 0) + window - now) / 60000))
             age_min = round((now - (entry0.get("at") or 0)) / 60000)
             if state0 == "bad":
-                print("  %s: 不可用（%d 分钟前失败，%d 分钟后过期恢复试探）→ 带图请求跳过" % (model, age_min, left_min))
+                if entry0.get("via") == "describe":
+                    print("  %s: 不可用（代看链路确认原生无视觉，%d 分钟前标记，%d 分钟后周度复核）→ 带图请求跳过" % (model, age_min, left_min))
+                else:
+                    print("  %s: 不可用（%d 分钟前失败，%d 分钟后过期恢复试探）→ 带图请求跳过" % (model, age_min, left_min))
             elif state0 == "good":
-                print("  %s: 可用（正学习确认）" % model)
+                print("  %s: 可用（原生视觉，正学习确认）" % model)
             else:
                 print("  %s: %s" % (model, state0))
         print("== 失败处理动作（learned.actions，执行中）==")
@@ -1487,7 +1660,10 @@ def main():
             if image_failed:
                 if targets and model_key not in targets and model not in targets:
                     continue
-                images[model_key] = {"state": "bad", "at": now_ms}
+                mark = {"state": "bad", "at": now_ms}
+                if isinstance(images.get(model_key), dict) and images[model_key].get("via") == "describe":
+                    mark["via"] = "describe"
+                images[model_key] = mark
                 updates[model_key] = {"kind": "skipImages"}
                 by = "rule"
             else:
@@ -1583,7 +1759,7 @@ def main():
         if targets and key not in targets:
             del images[key]
             continue
-        if isinstance(cur, dict) and cur.get("state") == "bad" and (now_ms - (cur.get("at") or 0)) >= args.ttl:
+        if isinstance(cur, dict) and cur.get("state") == "bad" and (now_ms - (cur.get("at") or 0)) >= image_bad_window(cur, args.ttl):
             del images[key]
 
     # ── 主动探测（probes）：早恢复发现 + 能力主动试探，替代被动等流量 ──
@@ -1596,7 +1772,7 @@ def main():
                 break
             if a.get("kind") == "pause":
                 elapsed = now_ms - (a.get("at") or 0)
-                if elapsed > (a.get("ttlMs") or 0) * 0.5 and probe_model(key, a.get("model"), images=False):
+                if elapsed > (a.get("ttlMs") or 0) * 0.5 and probe_model(key, a.get("model")):
                     actions.remove(a)
                     fails[a.get("model")] = 0
                     perf_model = perf.get(a.get("model"))
@@ -1612,18 +1788,33 @@ def main():
                 break
             if rule.get("type") != "images":
                 continue
-            for m in [rule.get("target")] + list(rule.get("fallbacks") or []):
+            cands = [rule.get("target")] + list(rule.get("fallbacks") or [])
+            for m in cands:
                 if probes >= 3 or not m:
                     continue
                 img = images.get(m)
                 unknown = not img
-                expired_bad = isinstance(img, dict) and img.get("state") == "bad" and (now_ms - (img.get("at") or 0)) >= args.ttl
-                if unknown or expired_bad:
-                    ok = probe_model(key, m, images=True)
-                    images[m] = {"state": "good" if ok else "bad", "at": now_ms}
+                expired_bad = (isinstance(img, dict) and img.get("state") == "bad"
+                               and (now_ms - (img.get("at") or 0)) >= image_bad_window(img, args.ttl))
+                if not (unknown or expired_bad):
+                    continue
+                res = probe_image_capability(key, m, cands)
+                if res["via"] == "describe":
+                    images[res["who"]] = {"state": "bad", "via": "describe", "at": now_ms}
+                    updates[res["who"]] = {"kind": "probe-images"}
+                    log("probe: %s 图片能力=不可用（主动试探：%s，原生无视觉）" % (
+                        res["who"], "200 走代看链路" if res["ok"] else "上游 can't-see-images"), args.quiet)
+                elif res["ok"] and res["who"] == m:
+                    images[m] = {"state": "good", "at": now_ms}
                     updates[m] = {"kind": "probe-images"}
-                    log("probe: %s 图片能力=%s（主动试探）" % (m, "可用" if ok else "不可用"), args.quiet)
-                    probes += 1
+                    log("probe: %s 图片能力=可用（主动试探：原生视觉）" % m, args.quiet)
+                elif res["ok"]:
+                    log("probe: %s 被改写至 %s，能力未判定（跳过）" % (m, res["served"]), args.quiet)
+                else:
+                    images[res["who"]] = {"state": "bad", "at": now_ms}
+                    updates[res["who"]] = {"kind": "probe-images"}
+                    log("probe: %s 图片能力=不可用（主动试探：请求失败）" % m, args.quiet)
+                probes += 1
 
     # ── 周期反思：审视学到的状态，发现过时/矛盾/覆盖缺口 ──
     insights = reflect_on_state(options.get("rules") or [], images, actions, perf, fails,
@@ -1671,7 +1862,7 @@ def main():
     # 画像中显式可见，供 --learned 展示、AI 反思与重排联动消费。
     for m, pstats in perf.items():
         img = images.get(m)
-        degraded = isinstance(img, dict) and img.get("state") == "bad" and (now_ms - (img.get("at") or 0)) < args.ttl
+        degraded = isinstance(img, dict) and img.get("state") == "bad" and (now_ms - (img.get("at") or 0)) < image_bad_window(img, args.ttl)
         if degraded:
             pstats["capabilityDegraded"] = "images"
         else:

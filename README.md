@@ -61,6 +61,7 @@ MIT。
 
 - **自举播种**：`python tools/route-learn.py --bootstrap`——新机器零配置：从网关 `/v1/models` 与 usage 日志里最近成功的成员自动生成 images 规则候选链（排除组 id 自环），并注册每 5 分钟的学习计划任务。仓库里 package.json 的 options 只是编辑器示例占位，不是生效规则。
 - **持续学习**：此后每 5 分钟增量读 magpie usage 日志——图片能力负学习（406/multimodal → 标 bad 6h，带图请求跳过）、失败动作（499→ignore、`expected a value <= N`→clampOutput 跟随声明值、429/5xx→pause 指数退避 2min×2^连败、任何 200 立即解除 pause）、未知签名经网关 AI 分类兜底（模型从历史成功/可用列表自动选择，不写死）。
+- **原生视觉 vs 代看图（0.3.44）**：带图请求的 200 不等于模型自己看得见图——magpie 会让 Image recognition 池的模型把图描述成文字再喂给无视觉模型。探针改用每次唯一的随机小图，并把 vision-cache.jsonl 的前后差异当作信号：出现新条目 = 走了代看链路 = 模型原生无视觉 → 标 `via:'describe'`；describer 池耗尽时 502 文案直接点名（`model X can't see images`），按名归因。via=describe 的标记不再按 6h TTL 衰减（中间件视其长期 incapable），改为每周复核，避免把无视觉模型排在有视觉候选前面；只有 200 且未走代看才标 good。
 - 学习结果写回本插件的 options（learned.images / learned.actions），中间件热拾取后按当前信念执行。
 
 新机器一条命令完成自举：`python tools/route-learn.py --bootstrap`

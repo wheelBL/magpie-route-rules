@@ -12,7 +12,10 @@
 // (route-learn) that watches magpie's usage log: a model whose image request
 // fails (406 / multimodal-flavoured errors) is marked bad for a TTL and is
 // skipped for later image requests, so rules stay declarative while the
-// actual targets adapt to the environment.
+// actual targets adapt to the environment. Since 0.3.44 a probe or a failed
+// image request can also prove a model has no native vision (magpie described
+// the image for it, or refused with "can't see images"): that mark carries
+// via:'describe' and is re-verified weekly instead of on every TTL.
 //
 // Failure-action learning (0.3.0): the companion also writes
 // `options.learned.actions` — one record per failure signature:
@@ -32,8 +35,10 @@
 //   clamp  true (default) — apply limits to max_tokens/max_completion_tokens.
 //   scope  [modelId | /regex/] — optional; only asked models matching the
 //          list are processed at all. Default: every request.
-//   learned { images: { modelId: {state, at} } } — read-only here; written by
-//          the route-learn companion.
+//   learned { images: { modelId: {state, at, via?} } } — read-only here;
+//          written by the route-learn companion. via:'describe' = the model
+//          only saw images through the describe fallback (no native vision):
+//          treated as incapable even past the TTL.
 //   learningTtlMs 6h — a 'bad' mark older than this is treated as unknown.
 //
 // The asked model's name is restored in replies (onEvent/onResponse), so an
@@ -127,6 +132,13 @@ function imageHealth(modelId, learnedImages, now, ttl) {
   const entry = learnedImages ? learnedImages[modelId] : null
   if (!entry || entry.state == null) return 'unknown'
   if (entry.state === 'good') return 'capable'
+  // via 'describe': the model was caught seeing images only through magpie's
+  // describe fallback (the Image recognition pool) — natively vision-less.
+  // That is a catalog-level property, not a transient failure, so the mark
+  // outlives the TTL instead of decaying to 'unknown' and putting a blind
+  // model ahead of candidates that at least might see. route-learn re-verifies
+  // it weekly (its own image_bad_window does the same).
+  if (entry.via === 'describe') return 'incapable'
   return (now - (entry.at || 0)) < ttl ? 'incapable' : 'unknown'
 }
 
