@@ -854,7 +854,9 @@ def compute_impact(usage_path, now_ms, window_days=7):
             if now_ms - epoch_ms > window_ms:
                 continue
             agent = str(row.get("agent") or "")
-            if "route-learn" in agent or agent == "Python-urllib":
+            # 内部调用（magpie 自身的代看/分类/反思、伴生探针）不是用户请求：
+            # 不进可用度/错误率/切换保障任何分子分母（与空回复率口径对齐，0.3.57）。
+            if "route-learn" in agent or agent in ("Python-urllib", "magpie"):
                 continue
             status = row.get("status")
             if isinstance(status, str) and status.isdigit():
@@ -925,7 +927,7 @@ def compute_impact(usage_path, now_ms, window_days=7):
                 except Exception:
                     continue
                 agent = str(row.get("agent") or "")
-                if "route-learn" in agent or agent == "Python-urllib":
+                if "route-learn" in agent or agent in ("Python-urllib", "magpie"):
                     continue
                 status = row.get("status")
                 if isinstance(status, str) and status.isdigit():
