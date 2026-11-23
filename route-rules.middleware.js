@@ -39,6 +39,10 @@
 //          written by the route-learn companion. via:'describe' = the model
 //          only saw images through the describe fallback (no native vision):
 //          treated as incapable even past the TTL.
+//   learned.payloadCaps { modelId: {minFailTok?, maxOkTok?} } — 413-learned
+//          capacity evidence: every rule's walk skips candidates known to
+//          refuse inputs this size, and with no rule at all the request is
+//          rewritten to the learned highest-capacity model (0.3.48).
 //   learningTtlMs 6h — a 'bad' mark older than this is treated as unknown.
 //
 // The asked model's name is restored in replies (onEvent/onResponse), so an
@@ -189,6 +193,20 @@ function pickImageTarget(candidates, learnedImages, now, ttl, payloadCaps, estTo
   return null
 }
 
+// Learned payload pre-filter: a candidate with 413-learned evidence it refuses
+// inputs this size is skipped. Every rule's walk applies it since 0.3.48
+// (images had it first); when all are filtered out the order stands
+// (fail-open — let the upstream speak for itself).
+function payloadPass(candidates, payloadCaps, estTok) {
+  if (!payloadCaps || !estTok || estTok <= 0) return candidates
+  const pass = candidates.filter((m) => {
+    const pc = payloadCaps[m]
+    return !(pc && Number.isFinite(pc.minFailTok) && estTok >= pc.minFailTok)
+  })
+  return pass.length ? pass : candidates
+}
+
+
 // Rough input-token estimate (chars/2, images ≈ 1k) — only used to compare
 // against learned 413 caps; a wrong estimate just falls through fail-open.
 function estimateInputTokens(body) {
@@ -266,7 +284,8 @@ export function onRequest(body, ctx) {
         const payloadCaps = (options.learned && options.learned.payloadCaps) || null
         target = pickImageTarget(candidates, learnedImages, now, ttl, payloadCaps, estimateInputTokens(body))
       } else if (candidates.length) {
-        target = candidates[0]
+        const payloadCaps = (options.learned && options.learned.payloadCaps) || null
+        target = payloadPass(candidates, payloadCaps, estimateInputTokens(body))[0]
       }
       if (target && target !== asked) {
         ctx.state.asked = asked
@@ -278,6 +297,32 @@ export function onRequest(body, ctx) {
         const learnedCap = learnedClampCap(target || asked, actions)
         if (learnedCap != null && requested > learnedCap) {
           clampTokens(body, keys, learnedCap)
+          changed = true
+        }
+      }
+    } else {
+      // Learned payload rescue (0.3.48): no rule matched, but the asked model
+      // has 413-learned evidence it refuses inputs this size. The old cannbot
+      // plugin's in-chain 413 retry is gone (its 1.0 rewrite is auth-only),
+      // so the middleware itself rewrites to the learned highest-capacity
+      // model instead of letting the same 413 repeat. Evidence-driven only.
+      const payloadCaps = (options.learned && options.learned.payloadCaps) || null
+      const estTok = payloadCaps ? estimateInputTokens(body) : 0
+      const askedPc = payloadCaps ? payloadCaps[asked] : null
+      if (askedPc && Number.isFinite(askedPc.minFailTok) && estTok >= askedPc.minFailTok) {
+        const actions = freshActions(options, Date.now())
+        let best = null
+        let bestCap = -Infinity
+        for (const m of Object.keys(payloadCaps)) {
+          if (m === asked) continue
+          const pc = payloadCaps[m]
+          if (!pc || !Number.isFinite(pc.maxOkTok) || pc.maxOkTok < estTok) continue
+          if (modelPaused(m, actions)) continue
+          if (pc.maxOkTok > bestCap) { best = m; bestCap = pc.maxOkTok }
+        }
+        if (best && best !== asked) {
+          ctx.state.asked = asked
+          body.model = best
           changed = true
         }
       }
