@@ -59,7 +59,7 @@ MIT。
 
 中间件按 magpie 设计是无状态的——发现与学习由 [tools/route-learn.py](./tools/route-learn.py) 伴生脚本承担：
 
-- **自举播种**：`python tools/route-learn.py --bootstrap`——新机器零配置：从网关 `/v1/models` 与 usage 日志里最近成功的成员自动生成 images 规则候选链（排除组 id 自环），并注册每 5 分钟的学习计划任务。仓库里 package.json 的 options 只是编辑器示例占位，不是生效规则。
+- **自举播种**：`python tools/route-learn.py --bootstrap`——新机器零配置：从网关 `/v1/models` 与 usage 日志里最近成功的成员自动生成 images 规则候选链（排除组 id 自环），并注册每 5 分钟的学习计划任务。仓库里 package.json 的 options 只是编辑器示例占位，不是生效规则。伴生任务自愈（0.3.49）：包的 Bun 宿主入口 index.mjs 在插件增/删/更/开关后随宿主重启加载，自动注册/重指向计划任务到包内 tools/route-learn.py——GUI 更新后新代码下一轮即生效，无需重新 bootstrap。
 - **持续学习**：此后每 5 分钟增量读 magpie usage 日志——图片能力负学习（406/multimodal → 标 bad 6h，带图请求跳过）、失败动作（499→ignore、`expected a value <= N`→clampOutput 跟随声明值、429/5xx→pause 指数退避 2min×2^连败、任何 200 立即解除 pause、空回复且输出全耗在 reasoning→ignore——请求预算问题不怪模型，0.3.46，AI 反思自身 max_tokens 同步提至 6000）、未知签名经网关 AI 分类兜底（模型从历史成功/可用列表自动选择，不写死）。0.3.47 修复 state 重建丢失持久字段（lastAiReflectAt/ignore_sigs/lastReflect）——AI 反思曾因此每 5 分钟重跑而非每 24h，已忽略签名反复进 AI 分类。
 - **原生视觉 vs 代看图（0.3.44）**：带图请求的 200 不等于模型自己看得见图——magpie 会让 Image recognition 池的模型把图描述成文字再喂给无视觉模型。探针改用每次唯一的随机小图，并把 vision-cache.jsonl 的前后差异当作信号：出现新条目 = 走了代看链路 = 模型原生无视觉 → 标 `via:'describe'`；describer 池耗尽时 502 文案直接点名（`model X can't see images`），按名归因。via=describe 的标记不再按 6h TTL 衰减（中间件视其长期 incapable），改为每周复核，避免把无视觉模型排在有视觉候选前面；只有 200 且未走代看才标 good。
 - 学习结果写回本插件的 options（learned.images / learned.actions），中间件热拾取后按当前信念执行。重排保护（0.3.45）：图片标记仍有效的模型不参与 images 规则换头——文本吞吐再高也不把盲模型换到头部把带图流量推回代看链路。payload 容量自适应（0.3.48 补全）：413 学到的 minFailTok 过滤扩展到所有规则的候选 walk；无规则命中且所问模型有拒收证据时直接改写到学习中容量最大的模型（cannbot 1.0 重写移除了 0.5.x 的 413 沿链重试，此职责由本中间件接管）。

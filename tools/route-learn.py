@@ -1206,21 +1206,32 @@ def bootstrap(entry, args, key):
         entry["options"] = options
         seeded = True
         summary = "已播种 images 规则：%s（fallbacks: %s）" % (candidates[0], ", ".join(candidates[1:]))
-    # register the learning scheduled task (Windows)
+    # register the learning scheduled task (Windows). The task prefers the
+    # INSTALLED package's copy of this script (plugins/node_modules/...), so
+    # `magpie plugin update` — GUI included — flows straight into the next
+    # run; 0.3.49's index.mjs repoints the task on every plugin-host restart.
     task_note = ""
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
     if not os.path.exists(pythonw):
         pythonw = sys.executable
-    tr = '"%s" "%s" --quiet' % (pythonw, os.path.abspath(__file__))
+    target = os.path.abspath(__file__)
+    installed = os.path.join(DEFAULT_CONFIG_DIR, "plugins", "node_modules",
+                             "magpie-route-rules", "tools", "route-learn.py")
+    if os.path.isfile(installed) and os.path.abspath(installed).lower() != target.lower():
+        target = os.path.abspath(installed)
+    tr = '"%s" "%s" --quiet' % (pythonw, target)
     try:
-        probe = subprocess.run(["schtasks", "/query", "/tn", "Magpie route learn"],
+        probe = subprocess.run(["schtasks", "/query", "/tn", "Magpie route learn", "/v", "/fo", "LIST"],
                                capture_output=True, text=True, timeout=20)
-        if probe.returncode != 0:
+        run_line = next((l for l in (probe.stdout or "").splitlines()
+                         if "Task To Run" in l or "要运行的任务" in l), "")
+        run_cmd = run_line.split(":", 1)[-1] if run_line else ""
+        if probe.returncode != 0 or target.lower() not in run_cmd.lower():
             subprocess.run(["schtasks", "/create", "/tn", "Magpie route learn", "/tr", tr,
                             "/sc", "minute", "/mo", "5", "/f"], check=True, timeout=20)
-            task_note = "；已注册计划任务（每 5 分钟学习）"
+            task_note = "；已注册/重指向计划任务（每 5 分钟，指向 %s）" % target
         else:
-            task_note = "；计划任务已存在"
+            task_note = "；计划任务已存在且指向包内脚本"
     except Exception as err:
         task_note = "；计划任务注册失败（%s），可手动注册" % err
     return summary + task_note
