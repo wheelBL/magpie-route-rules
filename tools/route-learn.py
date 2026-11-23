@@ -1614,7 +1614,8 @@ def main():
             view0 = with_impact(view0, state)
             if view0 != options.get("learnedView"):
                 backup(args.plugins)
-                options["learned"] = {"images": images0, "actions": actions0}
+                options["learned"] = {"images": images0, "actions": actions0,
+                                      "payloadCaps": learned0.get("payloadCaps") or {}}
                 options["learnedView"] = view0
                 entry["options"] = options
                 atomic_write_json(args.plugins, plugins)
