@@ -192,6 +192,11 @@ def rule_classify(row, clamp_skip_providers):
     # 模式容错拼写变体（exc[ce]ed）与 max/maximum 变体——正则多容错无成本。
     if re.search(r"input too long|exc[ce]ed max input|max input length|prompt is too long|context length|input length.{0,60}\d{4,}", err):
         return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
+    # 空回复且输出全花在 reasoning（"cut at its length ... raise max_tokens"）：
+    # 请求预算问题而非模型故障——同一模型在更大预算下服务正常（AI 反思自己的
+    # 调用就会踩这个，曾致 deepseek 每轮 18s 502 且反复被 pause）。不 pause。
+    if "empty reply" in err and "reasoning" in err:
+        return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
     # Rate limiting / upstream down: pause the model for a while. The exact
     # duration comes from the exponential backoff (the caller decides).
     if status == 429 or "rate limit" in err or "too many requests" in err:
@@ -774,7 +779,7 @@ def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_
         "\n【最近请求记录（新→旧）】\n" + recent_rows_text
     )
     messages = [{"role": "user", "content": REFLECT_PROMPT + record}]
-    return ai_chat(messages, args, candidates, max_tokens=2000)
+    return ai_chat(messages, args, candidates, max_tokens=6000)
 
 
 def norm_model(s):
