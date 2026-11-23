@@ -87,6 +87,7 @@ DEFAULT_PAUSE_BASE = 2 * 60 * 1000
 DEFAULT_PAUSE_MAX = 60 * 60 * 1000
 PAUSE_TTL_MS = 10 * 60 * 1000
 IGNORE_TTL_MS = 30 * 24 * 3600 * 1000
+REQCFG_TTL_MS = 24 * 3600 * 1000  # 请求侧问题（输入超长/空回复预算）的签名记忆：短 TTL 保证误判可自愈
 CLAMP_TTL_MS = 24 * 3600 * 1000
 SUCCESS_KEEP = 20
 DESCRIBE_REPROBE_MS = 7 * 24 * 3600 * 1000  # via='describe' marks: re-verify weekly
@@ -191,12 +192,12 @@ def rule_classify(row, clamp_skip_providers):
     # 归 payload 学习（payloadCaps）与用户自行缩减，学习侧只 ignore。
     # 模式容错拼写变体（exc[ce]ed）与 max/maximum 变体——正则多容错无成本。
     if re.search(r"input too long|exc[ce]ed max input|max input length|prompt is too long|context length|input length.{0,60}\d{4,}", err):
-        return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
+        return {"kind": "ignore", "ttlMs": REQCFG_TTL_MS}
     # 空回复且输出全花在 reasoning（"cut at its length ... raise max_tokens"）：
     # 请求预算问题而非模型故障——同一模型在更大预算下服务正常（AI 反思自己的
     # 调用就会踩这个，曾致 deepseek 每轮 18s 502 且反复被 pause）。不 pause。
     if "empty reply" in err and "reasoning" in err:
-        return {"kind": "ignore", "ttlMs": IGNORE_TTL_MS}
+        return {"kind": "ignore", "ttlMs": REQCFG_TTL_MS}
     # Rate limiting / upstream down: pause the model for a while. The exact
     # duration comes from the exponential backoff (the caller decides).
     if status == 429 or "rate limit" in err or "too many requests" in err:
@@ -275,7 +276,9 @@ def perf_score_bucket(pstats, bkey):
     b = (pstats.get("buckets") or {}).get(bkey)
     if b and (b.get("samples") or 0) >= 3 and b.get("ewmaTps"):
         ttfb = b.get("ewmaTtfbMs")
-        pen = 1.0 / (1.0 + (ttfb / 1000.0) / 10.0) if isinstance(ttfb, (int, float)) and ttfb > 0 else 1.0
+        # 桶内首字节惩罚同样要样本门槛（与全局 _ttfb_penalty 对齐）：ttfbSamples<3
+        # 不惩罚——数据不足不臆断，否则小样本桶的偶发慢首字节会虚假压分。
+        pen = 1.0 / (1.0 + (ttfb / 1000.0) / 10.0) if isinstance(ttfb, (int, float)) and ttfb > 0 and (b.get("ttfbSamples") or 0) >= 3 else 1.0
         bf, bs = b.get("fails") or 0, b.get("samples") or 0
         fail_pen = 1.0 / (1.0 + 2.0 * (bf / bs)) if bs > 0 else 1.0
         return round(b["ewmaTps"] / (1 + (b.get("consecFails") or 0)) * pen * fail_pen, 1)
@@ -1017,9 +1020,9 @@ def build_learned_view(perf, images, actions, insights, last_reflect, now_ms):
         "bucket": {"key": cur_bkey, "label": bucket_label(cur_bkey)},
         # 评分口径透明化（AI 反思建议）：公式/窗口/门槛全公开，可独立核验
         "scoring": {
-            "score": "tps ÷ (1+连败) × 首字节惩罚 ÷ (1+ttfb秒/10)；TTFB 需 ttfbSamples≥3",
-            "buckets": "周末×时段4桶共8桶，各自 EWMA(0.7/0.3)；桶内样本≥3 优先于全局分",
-            "reorder": "评分降序换头，挑战者需超现任 15%（迟滞防抖）；样本≥5 参与；capabilityDegraded 匹配规则类型 ×0.1；桶失败率再除 (1+2×rate)",
+            "score": "tps ÷ (1+连败) × 首字节惩罚 ÷ (1+ttfb秒/10)；TTFB 需 ttfbSamples≥3（桶内同门槛）；499/输入超长/空回复预算不计失败（服务失败口径）",
+            "buckets": "周末×时段4桶共8桶，各自 EWMA(0.7/0.3)；桶内样本≥3 优先于全局分；桶归属按行时间戳（非扫描时间）",
+            "reorder": "评分降序换头，挑战者需超现任 15%（迟滞防抖）；样本≥5 参与；capabilityDegraded 匹配规则类型 ×0.1；桶失败率再除 (1+2×rate)；ttfb 样本不足者不参与换头（现任不可信则本轮暂缓）；慢+失败联合（桶失败率≥30% 且快窗<0.6×慢窗）→ 10 分钟短熔断",
             "fastTps": "快窗 EWMA(0.3/0.7≈最近3样本) vs 慢窗(0.7/0.3)；<0.6 且样本≥5 → 趋势恶化告警",
             "attribution": "perf/失败/能力按 served（上游回显，归一化最长前缀匹配已知候选）归因；无回显退回 model 字段",
         },
@@ -1090,17 +1093,33 @@ def reflect_on_state(rules, images, actions, perf, fails, ignore_sigs, now_ms, i
             insights.append({"level": "info",
                              "text": "%s 性能样本已 %.0f 小时未更新（无流量或采集停滞，评分可能不反映现状）"
                                      % (m, age_h)})
-    # 2d. 桶级失败集中（反思建议"桶级失败上卷"）：绝对量（fails≥3 且样本≥5）
-    #     或 小样本高失败率（fails≥2 且 rate≥50%——另一机器实证 2/3 失败率
-    #     被绝对量阈值漏掉）——后者是"低样本高失败桶未触发降级"的修复。
+    # 2d. 桶级失败集中：绝对量（fails≥3 且样本≥5 且失败率≥10%）或小样本高失败率
+    #     （fails≥2 且 rate≥50%）。率下限 10% 是反思纠错：大桶 3-5% 的失败率属正常
+    #     基线噪声，曾把最佳时段桶误判降权（本机实证 16/321 与 37/1379 两例）。
     for m, p in perf.items():
         for bkey, b in (p.get("buckets") or {}).items():
             bf, bs = b.get("fails") or 0, b.get("samples") or 0
             rate = (bf / bs) if bs > 0 else 0
-            if (bf >= 3 and bs >= 5) or (bf >= 2 and rate >= 0.5):
+            if (bf >= 3 and bs >= 5 and rate >= 0.10) or (bf >= 2 and rate >= 0.5):
                 insights.append({"level": "warn",
                                  "text": "%s 在 %s 时段失败集中（%d/%d，%.0f%%）——该时段应自动降权，持续则人工检查"
                                          % (m, bucket_label(bkey), bf, bs, rate * 100)})
+    # 2e. 首字节样本不足（0.3.56）：评分不含时延惩罚 → 指标不可信，换头已暂缓
+    for m, p in perf.items():
+        if (p.get("samples") or 0) >= 5 and (p.get("ttfbSamples") or 0) < 3:
+            insights.append({"level": "info",
+                             "text": "%s 首字节样本不足（%d）——评分不含时延惩罚，指标不可信，已暂缓据此换头"
+                                     % (m, p.get("ttfbSamples") or 0)})
+    # 2f. 桶吞吐分化（反思发现）：某桶 tps 显著低于全局——流量特性或该时段退化，
+    #     与失败率合看（只看失败率曾漏掉 28.9 vs 78.9 tps 的极端分化）
+    for m, p in perf.items():
+        g = p.get("ewmaTps")
+        for bkey, b in (p.get("buckets") or {}).items():
+            bt, bs = b.get("ewmaTps"), b.get("samples") or 0
+            if isinstance(g, (int, float)) and g >= 5 and isinstance(bt, (int, float)) and bs >= 5 and bt < g * 0.5:
+                insights.append({"level": "warn",
+                                 "text": "%s 在 %s 时段吞吐显著低于全局（%.1f vs %.1f tok/s）——流量特性或该时段退化，结合失败率判断"
+                                         % (m, bucket_label(bkey), bt, g)})
     # 3. 从未被试探的候选：能力未知（可能是从未有过带图/该类流量的模型）
     unsampled = [m for m, p in perf.items() if int(p.get("samples") or 0) == 0]
     if unsampled:
@@ -1709,12 +1728,31 @@ def main():
         # 链内切换的请求性能记到真正干活的模型头上。
         model_key = resolve_attribution(row, provider, model, known_ids)
 
+        # 499 = 客户端主动取消：不是服务失败，不进任何画像/失败计数（口径卫生，0.3.56）。
+        if status == 499:
+            scan_diag["canceled499"] = scan_diag.get("canceled499", 0) + 1
+            continue
+
+        # 桶归属用行时间戳而非扫描时间：扫描滞后（宕机/积压/offset 回退）时两者可差
+        # 数小时，按扫描时间记桶会把旧行灌进当前桶（实测 16:49 的行进了上午桶）。
+        row_ms = _usage_epoch(row.get("t"))
+        row_ms = int(row_ms * 1000) if row_ms else now_ms
+
+        # 内容依赖失败（请求侧问题）：输入超长 / 空回复且全耗在 reasoning（请求预算）。
+        # 不算服务失败——只计样本量，不进连败/桶失败/重试风暴，避免误伤时段降权与熔断。
+        err_l = str(row.get("err") or "").lower()
+        empty_reply_budget = "empty reply" in err_l and "reasoning" in err_l
+        input_too_long = status == 413 or bool(re.search(
+            r"input too long|exc[ce]ed max input|max input length|input length.{0,40}\d{5,}|exceeds? the context (?:limit|length)", err_l))
+        content_dependent = empty_reply_budget or input_too_long
+
         # 每个完成请求都进性能画像：吞吐率/首字节 EWMA + 连败计数（稳定性）。
-        # 200 归零连败（自恢复），>=400 累加。
+        # consecFails = 服务失败口径（剔 499/内容依赖）；fails[] = pause 退避计数（仅
+        # pause 判定累加）——两者都由 200 归零，但计数范围不同，勿混用（0.3.56 统一）。
         pstats = perf.setdefault(model_key, {"samples": 0, "consecFails": 0, "ewmaTps": None, "ewmaTtfbMs": None, "lastAt": 0})
-        pstats["lastAt"] = now_ms
+        pstats["lastAt"] = row_ms
         pstats["samples"] = int(pstats.get("samples") or 0) + 1
-        bkey = bucket_key(now_ms)
+        bkey = bucket_key(row_ms)
         pbuckets = pstats.setdefault("buckets", {})
         pb = pbuckets.setdefault(bkey, {"samples": 0, "ewmaTps": None, "ewmaTtfbMs": None, "consecFails": 0})
         pb["samples"] = int(pb.get("samples") or 0) + 1
@@ -1744,7 +1782,7 @@ def main():
                 prevb = pb.get("ewmaTtfbMs")
                 pb["ewmaTtfbMs"] = round(ttft) if prevb is None else round(prevb * 0.7 + ttft * 0.3)
                 pb["ttfbSamples"] = int(pb.get("ttfbSamples") or 0) + 1
-        elif isinstance(status, int) and status >= 400:
+        elif isinstance(status, int) and status >= 400 and not content_dependent:
             pstats["consecFails"] = int(pstats.get("consecFails") or 0) + 1
             pb["consecFails"] = int(pb.get("consecFails") or 0) + 1
             # 桶级失败上卷（反思建议）：失败按时段桶计数，供"失败集中"洞察
@@ -1752,27 +1790,25 @@ def main():
             # 重试风暴感知（反思建议）：DSH 端一次失败会连发 5 次重试——
             # 同模型同窗口 ≥3 次失败 = 一次用户疼痛事件，应比散布失败更重。
             window_fails[model_key] = int(window_fails.get(model_key) or 0) + 1
-            # payload 上限学习：HTTP 413 或错误文本里的输入超长（另一机器实证：
-            # inferSrv 错误把 413 藏在 error_code 文本里，HTTP 状态不是 413）。
-            err_l = str(row.get("err") or "").lower()
-            input_too_long = status == 413 or re.search(
-                r"input too long|exc[ce]ed max input|max input length|input length.{0,40}\d{5,}|exceeds? the context (?:limit|length)", err_l)
-            if input_too_long:
-                # 优先从错误文本解析实际上超限的输入量（"current input length is N"），
-                # 退回 usage 行的 in 字段
-                in_tok = None
-                mtok = re.search(r"current input length is (\d+)", err_l) or re.search(r"input length.{0,30}?(\d{5,})", err_l) or re.search(r"context (?:limit|length)[^0-9]{0,10}(\d{5,})", err_l)
-                if mtok:
-                    in_tok = int(mtok.group(1))
-                if not (isinstance(in_tok, (int, float)) and in_tok > 0):
-                    in_tok = row.get("in")
-                if isinstance(in_tok, (int, float)) and in_tok > 0:
-                    pc = payload_caps.setdefault(model_key, {})
-                    mf = pc.get("minFailTok")
-                    pc["minFailTok"] = int(in_tok) if mf is None else min(mf, int(in_tok))
-                    pc["at"] = now_ms
 
-        # 200 行的大输入 = 承载证据下界（与 413 上界夹逼真实上限）
+        # payload 上限学习：HTTP 413 或错误文本里的输入超长（另一机器实证：
+        # inferSrv 错误把 413 藏在 error_code 文本里，HTTP 状态不是 413）。
+        # 内容依赖行不算服务失败（不进连败/桶失败），但仍是容量上界证据，必须学。
+        if isinstance(status, int) and status >= 400 and input_too_long:
+            # 优先从错误文本解析实际上超限的输入量（"current input length is N"），
+            # 退回 usage 行的 in 字段
+            in_tok = None
+            mtok = re.search(r"current input length is (\d+)", err_l) or re.search(r"input length.{0,30}?(\d{5,})", err_l) or re.search(r"context (?:limit|length)[^0-9]{0,10}(\d{5,})", err_l)
+            if mtok:
+                in_tok = int(mtok.group(1))
+            if not (isinstance(in_tok, (int, float)) and in_tok > 0):
+                in_tok = row.get("in")
+            if isinstance(in_tok, (int, float)) and in_tok > 0:
+                pc = payload_caps.setdefault(model_key, {})
+                mf = pc.get("minFailTok")
+                pc["minFailTok"] = int(in_tok) if mf is None else min(mf, int(in_tok))
+                pc["at"] = now_ms
+
         # 200 行的大输入 = 承载证据下界（与 413 上界夹逼真实上限）。
         # in 只记 cache-miss tokens：前缀缓存命中的大请求 in 会缩成几百，但完整
         # prompt 仍证明了模型装得下——证据必须用 in + cache_read（0.3.54）。
@@ -1907,8 +1943,27 @@ def main():
     # 一次用户疼痛事件；额外 +1 退避计数加速熔断，避免散布失败同权重。
     burst_models = [m for m, n in window_fails.items() if n >= 3]
     for m in burst_models:
-        fails[m] = int(fails.get(m) or 0) + 1
+        fails[m] = int(fails.get(m, 0)) + 1
 
+    # ── 慢+失败联合阈值自动触发（0.3.56）：单一时段降权之外，联合证据直接短熔断 ──
+    # 当前桶服务失败率 ≥30%（样本 ≥5）且吞吐趋势恶化（快窗 < 0.6×慢窗，样本 ≥5）
+    # → 10 分钟 pause（自动过期，任何 200 立即解除）。单独信号都不足以触发。
+    joint_bkey = bucket_key(now_ms)
+    for m, p in perf.items():
+        b = (p.get("buckets") or {}).get(joint_bkey) or {}
+        bf, bs = b.get("fails") or 0, b.get("samples") or 0
+        rate = (bf / bs) if bs > 0 else 0
+        ft, et = p.get("fastTps"), p.get("ewmaTps")
+        trend_bad = isinstance(ft, (int, float)) and isinstance(et, (int, float)) and et >= 5 \
+            and (p.get("samples") or 0) >= 5 and ft < et * 0.6
+        if bs >= 5 and rate >= 0.30 and trend_bad and find_action(m, "pause") is None:
+            actions.append({"model": m, "kind": "pause", "ttlMs": 10 * 60 * 1000, "at": now_ms,
+                            "by": "joint",
+                            "signature": "joint_%s_%s" % (m, joint_bkey),
+                            "reason": "慢+失败联合：桶失败率 %.0f%%（%d/%d）且快窗吞吐 %.1f < 0.6×慢窗 %.1f"
+                                      % (rate * 100, bf, bs, ft, et)})
+            updates[m] = {"kind": "joint-pause"}
+            log("联合熔断：%s 当前桶失败率 %.0f%%（%d/%d）且吞吐趋势恶化 → 暂停 10 分钟" % (m, rate * 100, bf, bs), args.quiet)
     # keep the success map bounded: most recent first
     success = dict(sorted(success.items(), key=lambda kv: -(kv[1].get("lastAt") or 0))[:SUCCESS_KEEP])
     # prune: expired actions, oversized list, stale image marks
@@ -1976,6 +2031,17 @@ def main():
                     log("probe: %s 图片能力=不可用（主动试探：请求失败）" % m, args.quiet)
                 probes += 1
 
+    # ── (c) 冷死探活（0.3.56）：有画像但 >24h 无流量的模型每天一次小 ping ──
+    # 防"无流量→无样本→永不参与重排"的路由冷死自我强化；每轮至多 1 个。
+    if args.auto_tune and not args.dry_run and key:
+        stale_probes = state.setdefault("staleProbes", {})
+        for m, p in list(perf.items()):
+            age_h = (now_ms - (p.get("lastAt") or 0)) / 3600000.0
+            if age_h > 24 and now_ms - (stale_probes.get(m) or 0) >= 24 * 3600 * 1000:
+                ok = probe_model(key, m)
+                stale_probes[m] = now_ms
+                log("probe: %s 冷死探活%s（%.0fh 无流量）" % (m, "成功" if ok else "失败", age_h), args.quiet)
+                break
     # ── 周期反思：审视学到的状态，发现过时/矛盾/覆盖缺口 ──
     insights = reflect_on_state(options.get("rules") or [], images, actions, perf, fails,
                                 state.get("ignore_sigs") or {}, now_ms, args.ttl)
@@ -2080,6 +2146,11 @@ def main():
             if len(eligible) < 2:
                 continue  # 视觉健康候选不足两个：保持现状（含无分数的头名），不换头
             cands = eligible
+        # 首字节样本不足的评分不含时延惩罚（偏高）——不可信者不参与换头（0.3.56）：
+        # 现任不可信 → 本轮暂缓换头，等样本积累；挑战者不可信 → 不进 known_scored。
+        head_p = perf.get(cands[0])
+        if head_p and (head_p.get("samples") or 0) >= 5 and (head_p.get("ttfbSamples") or 0) < 3:
+            continue
         scored = []
         for m in cands:
             pstats = perf.get(m)
@@ -2087,6 +2158,9 @@ def main():
             # 原 ≥2 门槛太宽；桶内分另有 ≥3 门槛）
             if pstats and (pstats.get("samples") or 0) >= 5:
                 s = perf_score_now(pstats, now_ms)
+                # 首字节样本不足 → 评分不含时延惩罚（偏高）：不可信者不得挑战争位
+                if s is not None and (pstats.get("ttfbSamples") or 0) < 3:
+                    s = None
                 # 能力标记 → 路由可用性联动：能力降级的成员在此类规则中大幅降权
                 # （capabilityDegraded 类型与规则类型一致才降权——images 降级只影响 images 规则）
                 if s is not None and pstats.get("capabilityDegraded") == rule.get("type"):
