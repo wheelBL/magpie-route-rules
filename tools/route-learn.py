@@ -1756,12 +1756,12 @@ def main():
             # inferSrv 错误把 413 藏在 error_code 文本里，HTTP 状态不是 413）。
             err_l = str(row.get("err") or "").lower()
             input_too_long = status == 413 or re.search(
-                r"input too long|exc[ce]ed max input|max input length|input length.{0,40}\d{5,}", err_l)
+                r"input too long|exc[ce]ed max input|max input length|input length.{0,40}\d{5,}|exceeds? the context (?:limit|length)", err_l)
             if input_too_long:
                 # 优先从错误文本解析实际上超限的输入量（"current input length is N"），
                 # 退回 usage 行的 in 字段
                 in_tok = None
-                mtok = re.search(r"current input length is (\d+)", err_l) or re.search(r"input length.{0,30}?(\d{5,})", err_l)
+                mtok = re.search(r"current input length is (\d+)", err_l) or re.search(r"input length.{0,30}?(\d{5,})", err_l) or re.search(r"context (?:limit|length)[^0-9]{0,10}(\d{5,})", err_l)
                 if mtok:
                     in_tok = int(mtok.group(1))
                 if not (isinstance(in_tok, (int, float)) and in_tok > 0):
