@@ -1046,7 +1046,18 @@ def compute_shadow_eval(usage_path, perf, state, now_ms, window_hours=24):
             if isinstance(status, str) and status.isdigit():
                 status = int(status)
             served = str(row.get("served") or row.get("model") or "")
-            pkey = next((k for k in perf if k == served or k.endswith("/" + served)), served)
+            # 归一化匹配 perf 键：上游回显名带快照后缀且点/横线不分（如
+            # deepseek-v4-1-flash-261017 vs cannbot/deepseek-v4.1-flash）——
+            # 先精确归一匹配，再容许纯数字快照后缀，防 glm-5.3 误吞 glm-5.3-flash。
+            sn = re.sub(r"[^a-z0-9]", "", served.lower())
+            pkey = served
+            for k in perf:
+                bn = re.sub(r"[^a-z0-9]", "", k.split("/")[-1].lower())
+                if sn == bn:
+                    pkey = k
+                    break
+                if re.fullmatch(re.escape(bn) + r"\d{0,8}", sn):
+                    pkey = k
             head = head_at(ts_ms)
             if not head or not pkey:
                 continue
