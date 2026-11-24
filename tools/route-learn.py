@@ -2355,6 +2355,10 @@ def main():
         log("已写入学习结果：actions=%d images=%s ai=%d%s" % (
             len(actions), json.dumps(images), ai_used,
             ("；AI 错误: " + "; ".join(ai_errors[:2])) if ai_errors else ""), args.quiet)
+    # 晚于 new_offset_state 浅拷贝才写入 state 的键（perfHeadLog/shadowEval 等）
+    # 也要持久化：setdefault 不覆盖已设的 offset，只补新键（0.3.60 修）
+    for _k, _v in state.items():
+        new_offset_state.setdefault(_k, _v)
     atomic_write_json(args.state, new_offset_state)
     if not actions and not updates:
         log("无新的失败样本（offset=%d）" % new_offset, args.quiet)
