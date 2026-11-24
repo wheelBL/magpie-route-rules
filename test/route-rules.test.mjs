@@ -173,6 +173,46 @@ test('学习：TTL 过期的 bad 视为 unknown，恢复首选试探', () => {
   assert.equal(out.model, 'cannbot/deepseek-v4.1-flash')
 })
 
+test('恶化迁移：所问模型带新鲜 pause → 迁移到 perfTop 榜首健康模型', () => {
+  const now = Date.now()
+  const learned = {
+    actions: [{ model: 'cannbot/glm-5.3', kind: 'pause', ttlMs: 3600000, at: now, by: 'rule' }],
+    perfTop: [
+      { model: 'cannbot/deepseek-v4.1-flash', score: 30 },
+      { model: 'cannbot/qwen3.8-max', score: 10 },
+    ],
+  }
+  const state = {}
+  const out = onRequest(body({ model: 'cannbot/glm-5.3', messages: [{ role: 'user', content: 'hi' }] }), ctx({ rules: [], learned, clamp: false }, state))
+  assert.equal(out.model, 'cannbot/deepseek-v4.1-flash')
+  assert.equal(state.asked, 'cannbot/glm-5.3')
+})
+
+test('恶化迁移：容量不足的榜首让位；未熔断/全员熔断均不改写（fail-open）', () => {
+  const now = Date.now()
+  const learned = {
+    actions: [{ model: 'cannbot/glm-5.3', kind: 'pause', ttlMs: 3600000, at: now }],
+    payloadCaps: { 'cannbot/deepseek-v4.1-flash': { minFailTok: 100 } },
+    perfTop: [
+      { model: 'cannbot/deepseek-v4.1-flash', score: 30 },
+      { model: 'cannbot/qwen3.8-max', score: 10 },
+    ],
+  }
+  const big = { model: 'cannbot/glm-5.3', messages: [{ role: 'user', content: 'x'.repeat(1000) }] }
+  const out = onRequest(big, ctx({ rules: [], learned, clamp: false }))
+  assert.equal(out.model, 'cannbot/qwen3.8-max', '榜首容量不足应落到次名')
+  const healthy = { actions: [], perfTop: [{ model: 'cannbot/deepseek-v4.1-flash', score: 30 }] }
+  assert.equal(onRequest(body({ model: 'cannbot/glm-5.3' }), ctx({ rules: [], learned: healthy, clamp: false })), undefined, '未熔断不改写')
+  const allPaused = {
+    actions: [
+      { model: 'cannbot/glm-5.3', kind: 'pause', ttlMs: 3600000, at: now },
+      { model: 'cannbot/deepseek-v4.1-flash', kind: 'pause', ttlMs: 3600000, at: now },
+    ],
+    perfTop: [{ model: 'cannbot/deepseek-v4.1-flash', score: 30 }],
+  }
+  assert.equal(onRequest(body({ model: 'cannbot/glm-5.3' }), ctx({ rules: [], learned: allPaused, clamp: false })), undefined, '全员熔断 fail-open')
+})
+
 test('学习：via=describe 的原生无视觉标记超过 TTL 仍视为 incapable', () => {
   const learned = { images: { 'cannbot/deepseek-v4.1-flash': { state: 'bad', via: 'describe', at: Date.now() - 7 * 24 * 3600e3 } } }
   const out = onRequest(imgBody(), ctx(imgOpts({ learned })))

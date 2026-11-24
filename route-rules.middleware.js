@@ -206,6 +206,23 @@ function payloadPass(candidates, payloadCaps, estTok) {
   return pass.length ? pass : candidates
 }
 
+// Degradation migration (0.3.59): the first score-sorted perfTop entry that is
+// not the asked model, not paused, and has learned capacity for this input.
+// perfTop arrives from the companion (trusted metrics only, currently not
+// paused at write time); pause is re-checked live here because actions can
+// change between companion cycles.
+function pickDegradationTarget(perfTop, asked, actions, payloadCaps, estTok) {
+  for (const entry of perfTop) {
+    const m = entry && entry.model
+    if (!m || m === asked) continue
+    if (modelPaused(m, actions)) continue
+    const pc = payloadCaps ? payloadCaps[m] : null
+    if (pc && Number.isFinite(pc.minFailTok) && estTok >= pc.minFailTok) continue
+    return m
+  }
+  return null
+}
+
 
 // Rough input-token estimate (chars/2, images ≈ 1k) — only used to compare
 // against learned 413 caps; a wrong estimate just falls through fail-open.
@@ -301,29 +318,52 @@ export function onRequest(body, ctx) {
         }
       }
     } else {
-      // Learned payload rescue (0.3.48): no rule matched, but the asked model
-      // has 413-learned evidence it refuses inputs this size. The old cannbot
-      // plugin's in-chain 413 retry is gone (its 1.0 rewrite is auth-only),
-      // so the middleware itself rewrites to the learned highest-capacity
-      // model instead of letting the same 413 repeat. Evidence-driven only.
+      // No rule matched — two learned, evidence-driven rewrites for plain
+      // requests (both fail open, both mask the asked name in replies):
+      //
+      // 1) Degradation migration (0.3.59): the asked model carries a fresh
+      //    learned pause (real upstream failure or the joint breaker) — a
+      //    session pinned to it would just die. Migrate to the best healthy
+      //    model from the companion's perfTop (score-sorted, trusted metrics
+      //    only). Deterministic argmax = sticky while conditions hold, so the
+      //    prefix cache survives the outage window; when the pause expires or
+      //    a probe resumes the model, rewrites stop and traffic returns.
+      //    Group ids never pause, so group requests keep magpie's own
+      //    failover untouched.
+      // 2) Payload rescue (0.3.48): the asked model has 413-learned evidence
+      //    it refuses inputs this size — rewrite to the learned highest-
+      //    capacity model instead of letting the same 413 repeat.
       const payloadCaps = (options.learned && options.learned.payloadCaps) || null
       const estTok = payloadCaps ? estimateInputTokens(body) : 0
-      const askedPc = payloadCaps ? payloadCaps[asked] : null
-      if (askedPc && Number.isFinite(askedPc.minFailTok) && estTok >= askedPc.minFailTok) {
-        const actions = freshActions(options, Date.now())
-        let best = null
-        let bestCap = -Infinity
-        for (const m of Object.keys(payloadCaps)) {
-          if (m === asked) continue
-          const pc = payloadCaps[m]
-          if (!pc || !Number.isFinite(pc.maxOkTok) || pc.maxOkTok < estTok) continue
-          if (modelPaused(m, actions)) continue
-          if (pc.maxOkTok > bestCap) { best = m; bestCap = pc.maxOkTok }
-        }
-        if (best && best !== asked) {
+      const actions = freshActions(options, Date.now())
+      const perfTop = options.learned && Array.isArray(options.learned.perfTop) ? options.learned.perfTop : []
+      let migrated = false
+      if (modelPaused(asked, actions) && perfTop.length) {
+        const target = pickDegradationTarget(perfTop, asked, actions, payloadCaps, estTok)
+        if (target) {
           ctx.state.asked = asked
-          body.model = best
+          body.model = target
           changed = true
+          migrated = true
+        }
+      }
+      if (!migrated) {
+        const askedPc = payloadCaps ? payloadCaps[asked] : null
+        if (askedPc && Number.isFinite(askedPc.minFailTok) && estTok >= askedPc.minFailTok) {
+          let best = null
+          let bestCap = -Infinity
+          for (const m of Object.keys(payloadCaps)) {
+            if (m === asked) continue
+            const pc = payloadCaps[m]
+            if (!pc || !Number.isFinite(pc.maxOkTok) || pc.maxOkTok < estTok) continue
+            if (modelPaused(m, actions)) continue
+            if (pc.maxOkTok > bestCap) { best = m; bestCap = pc.maxOkTok }
+          }
+          if (best && best !== asked) {
+            ctx.state.asked = asked
+            body.model = best
+            changed = true
+          }
         }
       }
     }

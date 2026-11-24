@@ -1628,7 +1628,8 @@ def main():
             if view0 != options.get("learnedView"):
                 backup(args.plugins)
                 options["learned"] = {"images": images0, "actions": actions0,
-                                      "payloadCaps": learned0.get("payloadCaps") or {}}
+                                      "payloadCaps": learned0.get("payloadCaps") or {},
+                                      "perfTop": learned0.get("perfTop") or []}
                 options["learnedView"] = view0
                 entry["options"] = options
                 atomic_write_json(args.plugins, plugins)
@@ -2204,16 +2205,28 @@ def main():
             log("效果量化已更新：7d %d 请求 / 切换保障 %d 次（%.1f%%）/ 可用度 %.1f%%"
                 % (impact["requests"], impact["saves"], impact["switchGuaranteedPct"], impact["availability"]), args.quiet)
 
+    # 文本恶化迁移榜（0.3.59）：当前桶评分降序，只收指标可信（samples≥5 且 ttfb≥3）
+    # 且当前未被熔断的模型——中间件在所问模型带新鲜 pause 时按此榜迁移会话。
+    # 榜单确定性 = 迁移粘性：条件不变则目标不变，前缀缓存得以保持。
+    perf_top = []
+    for m, p in perf.items():
+        if (p.get("samples") or 0) >= 5 and (p.get("ttfbSamples") or 0) >= 3 and find_action(m, "pause") is None:
+            s = perf_score_now(p, now_ms)
+            if s is not None:
+                perf_top.append({"model": m, "score": s})
+    perf_top.sort(key=lambda e: -e["score"])
+    perf_top = perf_top[:8]
     learned_view = build_learned_view(perf, images, actions, insights, state.get("lastReflect"), now_ms)
     learned_view = with_impact(learned_view, state)
     view_changed = learned_view != options.get("learnedView")
     changed = actions != (learned.get("actions") if isinstance(learned.get("actions"), list) else []) \
         or images != (learned.get("images") if isinstance(learned.get("images"), dict) else {}) \
         or payload_caps != (learned.get("payloadCaps") if isinstance(learned.get("payloadCaps"), dict) else {}) \
+        or perf_top != (learned.get("perfTop") or []) \
         or view_changed
     if changed:
         backup(args.plugins)
-        options["learned"] = {"images": images, "actions": actions, "payloadCaps": payload_caps}
+        options["learned"] = {"images": images, "actions": actions, "payloadCaps": payload_caps, "perfTop": perf_top}
         options["learnedView"] = learned_view
         entry["options"] = options
         atomic_write_json(args.plugins, plugins)
