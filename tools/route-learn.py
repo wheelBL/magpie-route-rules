@@ -774,7 +774,7 @@ REFLECT_PROMPT = (
 )
 
 
-def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_text, candidates):
+def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_text, candidates, shadow=None):
     record = (
         "【性能画像】\n" + json.dumps(perf, ensure_ascii=False) +
         "\n【图片能力标记】\n" + json.dumps(images, ensure_ascii=False) +
@@ -782,6 +782,12 @@ def ai_deep_reflect(args, perf, success, images, actions, insights, recent_rows_
         "\n【规则反思器的洞察】\n" + json.dumps([i.get("text") for i in insights], ensure_ascii=False) +
         "\n【最近请求记录（新→旧）】\n" + recent_rows_text
     )
+    if shadow:
+        record += (
+            "\n\n【主动择优影子评估（二期决策数据，未改变任何路由）】\n" + json.dumps(shadow, ensure_ascii=False) +
+            "\n请基于此数据评估：无故障时也按当前桶评分主动选优（二期）是否值得做——重点关注榜首更替频率（缓存代价）、"
+            "反事实净时延（收益）、缓存依赖度（换模损失面）、可避免失败数；给出建议与还需采集的数据。"
+        )
     messages = [{"role": "user", "content": REFLECT_PROMPT + record}]
     return ai_chat(messages, args, candidates, max_tokens=6000)
 
@@ -982,6 +988,109 @@ def compute_impact(usage_path, now_ms, window_days=7):
             "wouldFail": saves,
         },
         "beforeAfter": before_after,
+    }
+
+
+def compute_shadow_eval(usage_path, perf, state, now_ms, window_hours=24):
+    """主动择优二期影子评估（0.3.60）：不改任何路由，只采集决策所需数据，
+    喂给每日 AI 反思供用户事后拍板。四块：
+    - 榜首更替（perfHeadLog 回溯）：换头抖动 = 逐请求择优的缓存代价上界；
+    - 反事实时延：文本 200 的实际首字节 vs 当时应属榜首的桶内画像（净节省/净代价）；
+    - 缓存依赖度：各模型 cache_read 占比中位（换模的缓存损失面）；
+    - 可避免失败：非内容依赖失败行中当时榜首健康的数量。
+    全部近似（画像漂移、榜首 5 分钟粒度），够决策即可。"""
+    import datetime
+    head_log = state.get("perfHeadLog") or []
+    if not head_log:
+        return None
+    window_ms = window_hours * 3600 * 1000
+
+    def head_at(ts_ms):
+        best = head_log[0].get("model")
+        for e in head_log:
+            if e.get("t", 0) <= ts_ms:
+                best = e.get("model")
+            else:
+                break
+        return best
+
+    text_n = on_head = divergent = 0
+    save_s = cost_s = 0.0
+    avoided = 0
+    cache_share = {}
+    try:
+        size = os.path.getsize(usage_path) if os.path.exists(usage_path) else 0
+        if size <= 0:
+            return None
+        with open(usage_path, "rb") as fh:
+            fh.seek(max(0, size - 20 * 1024 * 1024))
+            text = fh.read().decode("utf-8", "replace")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts_ms = int(datetime.datetime.fromisoformat(str(row.get("t"))).timestamp() * 1000)
+            except Exception:
+                continue
+            if now_ms - ts_ms > window_ms:
+                continue
+            agent = str(row.get("agent") or "")
+            if "route-learn" in agent or agent in ("Python-urllib", "magpie"):
+                continue
+            status = row.get("status")
+            if isinstance(status, str) and status.isdigit():
+                status = int(status)
+            served = str(row.get("served") or row.get("model") or "")
+            pkey = next((k for k in perf if k == served or k.endswith("/" + served)), served)
+            head = head_at(ts_ms)
+            if not head or not pkey:
+                continue
+            err_l = str(row.get("err") or "").lower()
+            content_dep = status == 413 or ("empty reply" in err_l and "reasoning" in err_l)
+            if status == 200:
+                if pkey.startswith("group/"):
+                    continue  # 组流量不参与（二期也不碰）
+                text_n += 1
+                in_v, cr = row.get("in") or 0, row.get("cache_read") or 0
+                if in_v + cr > 0:
+                    lst = cache_share.setdefault(pkey, [])
+                    lst.append(cr / (in_v + cr))
+                if pkey == head:
+                    on_head += 1
+                    continue
+                head_p = perf.get(head) or {}
+                hb = (head_p.get("buckets") or {}).get(bucket_key(ts_ms)) or {}
+                head_ttft = hb.get("ewmaTtfbMs")
+                actual = row.get("ttft_ms") or row.get("ms")
+                if isinstance(head_ttft, (int, float)) and isinstance(actual, (int, float)) and actual > 0:
+                    divergent += 1
+                    d = (actual - head_ttft) / 1000.0
+                    if d > 0:
+                        save_s += d
+                    else:
+                        cost_s += -d
+            elif isinstance(status, int) and status >= 400 and status != 499 and not content_dep:
+                if pkey != head and pkey and not pkey.startswith("group/"):
+                    avoided += 1
+    except Exception:
+        return None
+    swaps = sum(1 for a, b in zip(head_log, head_log[1:]) if a.get("model") != b.get("model") and b.get("t", 0) >= now_ms - window_ms)
+    return {
+        "windowHours": window_hours,
+        "textRequests": text_n,
+        "onHeadPct": round(100.0 * on_head / text_n, 1) if text_n else None,
+        "headSwaps24h": swaps,
+        "headNow": (head_log[-1] or {}).get("model"),
+        "divergentRequests": divergent,
+        "counterfactualSaveS": round(save_s, 1),
+        "counterfactualCostS": round(cost_s, 1),
+        "avoidableFailures": avoided,
+        "cacheReadShareMedian": {m: round(sorted(v)[len(v) // 2], 3) for m, v in sorted(cache_share.items()) if v},
     }
 
 
@@ -2043,13 +2152,15 @@ def main():
     state["insights"] = insights[:10]
 
     # ── AI 深度反思（--reflect）：验证规则洞察 + 发现未覆盖的问题 ──
+    # ── AI 深度反思（--reflect）：验证规则洞察 + 发现未覆盖的问题；
+    # 影子评估数据一并入题，请 AI 给出二期（主动择优）可行性与建议 ──
     if args.reflect and not args.no_ai:
         available = fetch_available_models(key)
         candidates = ai_candidates(args, success, available, perf)
         recent_rows_text = "\n".join(lines[-max(1, args.explain_rows):])
         print("== AI 深度反思 ==")
         narrative, used, err = ai_deep_reflect(args, perf, success, images, actions,
-                                               insights, recent_rows_text, candidates)
+                                               insights, recent_rows_text, candidates, shadow=state.get("shadowEval"))
         if narrative is None:
             print("（AI 深度反思不可用：%s）" % err)
         else:
@@ -2069,7 +2180,7 @@ def main():
                 candidates = ai_candidates(args, success, available, perf)
                 recent_rows_text = "\n".join(lines[-max(1, args.explain_rows):])
                 narrative, used, err = ai_deep_reflect(args, perf, success, images, actions,
-                                                       insights, recent_rows_text, candidates)
+                                                       insights, recent_rows_text, candidates, shadow=state.get("shadowEval"))
                 if narrative:
                     state["lastReflect"] = {"at": now_ms, "model": used, "text": narrative[:8000]}
                     log("AI 深度反思自动完成（%s）——洞察 %d 条" % (used, len(insights)), args.quiet)
@@ -2216,6 +2327,17 @@ def main():
                 perf_top.append({"model": m, "score": s})
     perf_top.sort(key=lambda e: -e["score"])
     perf_top = perf_top[:8]
+    # 榜首史（影子评估用）：head 变化时追加，5 分钟粒度回溯当时的应选者
+    head_log = state.setdefault("perfHeadLog", [])
+    if perf_top and (not head_log or head_log[-1].get("model") != perf_top[0]["model"]):
+        head_log.append({"t": now_ms, "model": perf_top[0]["model"]})
+        del head_log[:-500]
+    # 影子评估（每小时，与效果量化同节拍）：只采集二期决策数据，不改路由
+    if now_ms - (state.get("lastShadowScan") or 0) >= 3600 * 1000:
+        shadow = compute_shadow_eval(args.usage, perf, state, now_ms)
+        if shadow:
+            state["shadowEval"] = shadow
+            state["lastShadowScan"] = now_ms
     learned_view = build_learned_view(perf, images, actions, insights, state.get("lastReflect"), now_ms)
     learned_view = with_impact(learned_view, state)
     view_changed = learned_view != options.get("learnedView")
